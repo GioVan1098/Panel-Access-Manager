@@ -1,10 +1,12 @@
 # PAM — Panel Access Manager
 ## Technical Architecture & Security Design Document
 
-**Version**: 2.0 (Architecture Extended — Hardened Variant)
-**Date**: 2026-03-17
+**Version**: 3.0 (Critical Fixes + Infrastructure Review)
+**Date**: 2026-03-18
 **Status**: Architecture finalized — implementation pending
 **Origin project**: rofi-bridge (SVA) → evolved into PAM
+
+**Changelog v3.0**: Fixed logical error in WireGuard topology (daemon endpoint is PC wg0 IP 10.0.0.2, not VPS 10.0.0.1). Added nonce cache persistence (SQLite, C1). Added setcap systemd guard (C2). Added Flutter fallback logic hardened→LAN (C3). Added NTP prerequisite (C4). Added PC sleep, client key loss, port conflict residual risks (C5/C6/C7). Added Section 18 (Implementation Pitfalls) and Section 19 (Comparison with existing solutions).
 
 ---
 
@@ -27,6 +29,8 @@
 15. [Network Threat Categories](#15-network-threat-categories)
 16. [PAM-hardened Architecture — WireGuard Relay](#16-pam-hardened-architecture--wireguard-relay)
 17. [Untrusted Network Mitigations](#17-untrusted-network-mitigations)
+18. [Implementation Notes — Critical Pitfalls](#18-implementation-notes--critical-pitfalls)
+19. [Comparison with Existing Solutions](#19-comparison-with-existing-solutions)
 
 ---
 
@@ -51,7 +55,7 @@
 | Variant | Transport | Network | Bind address | Server SAN |
 |---|---|---|---|---|
 | **PAM** | HTTPS direct | Trusted LAN or cryptographically untrusted LAN | `<LAN_IP>:7443` | `IP:<LAN_IP>, DNS:hostname.local` |
-| **PAM-hardened** | HTTPS over WireGuard tunnel | Any network — exposed, attacked, open public WiFi | `10.0.0.1:7443` (wg0) | `IP:10.0.0.1` |
+| **PAM-hardened** | HTTPS over WireGuard tunnel | Any network — exposed, attacked, open public WiFi | `10.0.0.2:7443` (wg0 PC) | `IP:10.0.0.2` |
 
 **Note**: the daemon code (`bridge_v2.py`), the GTK GUI, and the Flutter app are **identical** across variants. The only differences are the WireGuard tunnel layer and the IP binding.
 
@@ -385,7 +389,7 @@ The Android app connects to `rofi-bridge.local` (mDNS-resolved), not to the IP. 
 
 mDNS (Avahi on Linux) announces `rofi-bridge.local → current LAN IP` to all devices on the local segment. The announcement is updated whenever the IP changes (Avahi monitors interface changes). The app always connects to the same logical address while the physical IP is abstracted away.
 
-**Note — PAM-hardened**: This problem is also solved structurally by the WireGuard overlay. The daemon binds to `10.0.0.1` (the WireGuard interface IP on the VPS relay) — a stable, static IP that never changes regardless of what the underlying physical network assigns.
+**Note — PAM-hardened**: This problem is also solved structurally by the WireGuard overlay. The daemon binds to `10.0.0.2` (the PC's WireGuard interface IP) — a stable, static IP that never changes regardless of what the underlying physical network assigns. The VPS routes packets between WireGuard peers; the daemon itself runs on the PC, not on the relay.
 
 ---
 
@@ -413,7 +417,7 @@ server = HTTPSServer((LAN_IP, PORT), Handler, ssl_context)
 
 Additionally bound to loopback (`127.0.0.1`) for local GUI interactions, creating two separate server instances.
 
-**PAM-hardened**: Daemon binds to the WireGuard interface IP (`10.0.0.1` on the PC's wg0 interface). Only devices inside the WireGuard tunnel can reach it.
+**PAM-hardened**: Daemon binds to the PC's WireGuard interface IP (`10.0.0.2`). Only devices inside the WireGuard tunnel — routed through the VPS — can reach it. The VPS (10.0.0.1) is the routing hub only; it runs no application-layer services.
 
 **How It Works**
 
@@ -731,6 +735,8 @@ class RateLimiter:
 TLS-layer rate limiting: max 5 simultaneous incomplete TLS handshakes accepted.
 
 **On untrusted/exposed and open networks**: an additional **global** TLS handshake rate limit is added — max 5 completed handshakes per second across all IPs, regardless of source. This counters port-scan tools and TLS probe floods from multiple sources that would bypass per-IP limits. See Section 17 for full details.
+
+**Nonce cache implementation requirement**: The nonce cache must be persisted to disk (SQLite). An in-memory-only implementation creates a replay attack window: if the daemon restarts (system update, crash, reboot), the cache is lost. An attacker who captured a valid signed request before the restart can replay it within the ±30s timestamp window after restart. SQLite persistence closes this gap — nonces are written to disk on arrival and purged at startup only after TTL expiry. See Section 18 for implementation details.
 
 ---
 
@@ -1050,17 +1056,17 @@ relay-setup.sh Phase B — PC (part of setup.sh --hardened):
      PersistentKeepalive = 25
      EOF
   3. systemctl enable --now wg-quick@wg0
-  4. # Generate server cert with SAN IP = 10.0.0.1 (wg0 VPS IP, not LAN IP)
-     #   IP.1=10.0.0.1, IP.2=127.0.0.1
+  4. # Generate server cert with SAN IP = 10.0.0.2 (PC wg0 IP — the daemon endpoint)
+     #   IP.1=10.0.0.2, IP.2=127.0.0.1
      #   No mDNS DNS entries (mDNS disabled in hardened mode)
-  5. # Daemon binds to 10.0.0.2 (PC wg0 IP) or 10.0.0.1 via VPS forward
-  6. systemctl --user enable --now rofi-bridge  # binds wg0 IP
+  5. systemctl --user enable --now rofi-bridge  # binds 10.0.0.2 (PC wg0 interface)
 
 Android App:
   - Install WireGuard app
   - Configure peer: endpoint = <VPS_PUBLIC_IP>:51820, AllowedIPs = 10.0.0.0/24
-  - AllowedIPs routes PAM traffic through tunnel; other traffic goes direct
-  - After WireGuard connected: provisioning address = 10.0.0.1 (or 10.0.0.2 depending on routing)
+  - AllowedIPs routes PAM traffic through tunnel; all other traffic goes direct (split tunnel)
+  - VPS routes inner IP packets: 10.0.0.3 (Android) → 10.0.0.2 (PC daemon) via IP forwarding
+  - After WireGuard connected: provisioning and runtime address = 10.0.0.2:7443
 ```
 
 **Traffic path (PAM-hardened)**:
@@ -1094,7 +1100,7 @@ PC — GUI GTK:
   2. Computes server_cert_fingerprint = SHA-256(server.crt in DER format)
   3. Displays QR containing:
      PAM:         { "addr": "192.168.1.100:7443", "otp": "<hex>", "fp": "<b64>" }
-     PAM-hardened:{ "addr": "10.0.0.1:7443",      "otp": "<hex>", "fp": "<b64>" }
+     PAM-hardened:{ "addr": "10.0.0.2:7443",      "otp": "<hex>", "fp": "<b64>" }
   4. QR refreshes every 55 seconds (countdown shown)
   5. (Untrusted network mode): manual confirmation dialog displayed — admin must
      explicitly click "Accept Provisioning" after QR scan before OTP is activated
@@ -1151,7 +1157,7 @@ Android App:
               → Ed25519_sign(hardware_private_key, payload)
 
   POST https://rofi-bridge.local:7443/run         (PAM)
-  POST https://10.0.0.1:7443/run                  (PAM-hardened)
+  POST https://10.0.0.2:7443/run                  (PAM-hardened)
     TLS: custom SecurityContext with ca_cert → validates server cert
     mTLS: presents tls_cert + proves possession of tls_key
     Body: { "payload": payload, "sig": signature_b64 }
@@ -1226,7 +1232,7 @@ GUI GTK — "Revoke & Regenerate All":
 | **Auth** | Ed25519 signature verification (PyCA `cryptography` library) |
 | **Command execution** | `subprocess` with explicit `argv` list (no `sh -c`) |
 | **Rate limiting** | 10 req/60s per IP, ban 1h after 3 failures; global 5 handshakes/s (untrusted mode) |
-| **Nonce cache** | LRU dict, 5-minute TTL, max 10,000 entries |
+| **Nonce cache** | SQLite persistent (`nonces.db`), 5-minute TTL, purged on startup; survives daemon restart |
 | **Audit log** | Append-only, HMAC-SHA256 per line |
 | **Dependencies** | `zeroconf` (optional, PAM only), `cryptography`, `tomllib` (stdlib 3.11+) |
 
@@ -1253,6 +1259,25 @@ GUI GTK — "Revoke & Regenerate All":
 | **Execution** | `execv("/usr/sbin/iptables", explicit_argv)` — no shell |
 | **Install path** | `/usr/lib/rofi-bridge/ipt-helper` |
 | **Build** | Compiled by `setup.sh`, `gcc -O2 -Wall` |
+| **Capability guard** | `pam-setcap.service` (systemd oneshot, `Before=rofi-bridge.service`) |
+
+**pam-setcap.service** — ensures `setcap` survives system updates that may reinstall or overwrite the binary:
+
+```ini
+[Unit]
+Description=PAM ipt-helper capability guard
+Before=rofi-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'getcap /usr/lib/rofi-bridge/ipt-helper | grep -q cap_net_admin || setcap cap_net_admin+eip /usr/lib/rofi-bridge/ipt-helper'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
+```
+
+This runs at every boot before the daemon starts. If a system update replaces `ipt-helper` without the capability (e.g., package reinstall), the guard re-applies it. Without this, `ipt-helper` silently loses `CAP_NET_ADMIN` and the daemon fails to execute firewall commands with no clear error message.
 
 ---
 
@@ -1304,24 +1329,61 @@ final keyPair = keyPairGenerator.generateKeyPair();
 // → public key: send to server during provisioning
 ```
 
+**PAM-hardened fallback logic** — if the WireGuard tunnel is unavailable (VPS down, no internet), the app attempts to fall back to direct LAN connection:
+
+```dart
+Future<HttpClient> _resolveClient() async {
+  if (_config.mode == PamMode.hardened) {
+    // Try hardened endpoint (10.0.0.2 via WireGuard)
+    try {
+      final client = _buildClient();
+      await client.getUrl(Uri.parse('https://10.0.0.2:7443/health'))
+          .timeout(const Duration(seconds: 5));
+      return client;
+    } on TimeoutException {
+      // WireGuard tunnel unavailable → fall back to stored LAN IP
+    } on SocketException {
+      // No route through tunnel → fall back
+    }
+  }
+  // PAM direct or hardened fallback: use stored LAN IP
+  return _buildClient();
+}
+```
+
+The stored LAN IP is the address captured during provisioning, saved in `flutter_secure_storage` alongside the certs. Fallback is attempted once; if both fail, the user sees an explicit connection error. Fallback requires the device to be on the same LAN as the PC (home network) — it is not available on public WiFi.
+
 ---
 
 ### 9.5 — setup.sh
 
 **Responsibilities**:
-1. CA generation + encryption + offline storage
-2. Server cert generation with SAN
-3. ipt-helper compilation + `setcap` installation
-4. Server key loading into Linux Kernel Keyring
-5. Systemd user service installation + startup
-6. Initial health check verification
+1. Prerequisite check: NTP synchronization active (`systemctl is-active systemd-timesyncd || chrony`)
+2. CA generation + encryption + offline storage
+3. Server cert generation with SAN
+4. ipt-helper compilation + `setcap` installation
+5. `pam-setcap.service` installation + enable
+6. Server key loading into Linux Kernel Keyring
+7. Systemd user service installation + startup
+8. Initial health check verification
+
+**NTP prerequisite check** — the timestamp ±30s replay window requires synchronized clocks on both sides. If NTP is not active at setup time, setup.sh exits with a clear error:
+
+```bash
+if ! systemctl is-active --quiet systemd-timesyncd && ! systemctl is-active --quiet chronyd; then
+    echo "ERROR: No NTP service active. Run: systemctl enable --now systemd-timesyncd" >&2
+    exit 1
+fi
+```
 
 **Flags**:
 - `setup.sh` — fresh PAM installation (LAN IP bind)
-- `setup.sh --hardened` — PAM-hardened (wg0 bind, SAN IP=10.0.0.1, mDNS disabled)
+- `setup.sh --hardened` — PAM-hardened (wg0 bind 10.0.0.2, SAN IP=10.0.0.2, mDNS disabled)
 - `setup.sh --regenerate-server-cert` — new server cert (CA unchanged)
 - `setup.sh --regenerate-all` — new CA + server cert (all devices must re-provision)
 - `setup.sh --uninstall` — removes all components
+
+**Idempotency**: all operations check for existing state before executing. Re-running `setup.sh` on an already-configured system does not overwrite existing certs or configs unless `--regenerate-*` flags are used.
 
 ---
 
@@ -1334,7 +1396,7 @@ final keyPair = keyPairGenerator.generateKeyPair();
 4. UFW rules on VPS (allow UDP/51820, deny TCP/7443 from outside, allow from 10.0.0.0/24)
 5. IP forwarding enable on VPS (`net.ipv4.ip_forward=1`)
 6. systemd WireGuard service activation on both ends
-7. Connectivity verification (`wg show`, `ping 10.0.0.1`)
+7. Connectivity verification (`wg show`, `ping 10.0.0.1` from PC to VPS, `ping 10.0.0.2` from VPS to PC)
 
 **Oracle Free Tier selection rationale**:
 
@@ -1488,6 +1550,44 @@ This is in contrast to TLS which negotiates cipher suites (and can be downgraded
 
 ---
 
+### R7 — Clock Drift / NTP Unavailability
+
+**Risk**: Replay protection relies on a ±30-second timestamp window validated against server time. If the PC clock drifts significantly (e.g., after a long sleep, VM suspension, or NTP outage) or the Android device clock is wrong, legitimate commands will be rejected with timestamp errors. Conversely, if both clocks drift in the same direction by more than 30 seconds, a recorded replay attack may fall outside the current valid window — but only until clocks resync.
+
+**Resolution**:
+- `setup.sh` verifies that `systemd-timesyncd` or `chronyd` is active before completing setup. Setup exits with an explicit error if no NTP service is running.
+- The daemon logs timestamp rejection events to the audit log with the received and server timestamps, enabling diagnosis.
+- Android's clock is managed by the OS via NTP on any internet connection. No application-level action needed.
+
+**Residual risk**: In offline or air-gapped environments without NTP, the ±30s window must be widened manually or the timestamp check relaxed. This is an operational configuration decision and is outside the default threat model.
+
+---
+
+### R8 — PC Sleep and WireGuard Tunnel Interruption (PAM-hardened)
+
+**Risk**: When the PC enters sleep or suspend, the WireGuard interface goes down. The VPS relay continues to accept packets from Android but they are not forwarded to the PC (route is unreachable). The VPS does not know the PC is offline until the WireGuard keepalive interval expires (default: 25 seconds). Commands sent during this window are silently dropped — no error is returned to the app.
+
+**Resolution (partial)**:
+- The Flutter app implements a 5-second health check timeout (`GET /health`) before sending any command. If the health check fails, the app displays an explicit "daemon unreachable" error rather than silently losing the command.
+- Wake-on-LAN (WoL) can be configured as a complement: the app sends a WoL magic packet to the PC's MAC address before attempting the health check. This requires the PC to have WoL enabled in BIOS/UEFI and a network adapter that supports it.
+
+**Accepted limitation**: Full reliability against sleep interruption requires hardware-level WoL support. This cannot be solved in software alone. The health check provides user-visible feedback instead of silent failure.
+
+---
+
+### R9 — Android Device Loss / Key Non-Exportability
+
+**Risk**: Ed25519 signing keys are generated inside the Android Keystore with hardware backing (available on Android 9+, Strongbox on Android 10+). Hardware-backed keys are deliberately non-exportable and are explicitly excluded from Android backup mechanisms (including Google Backup, ADB backup, and OEM cloud backups). If the device is lost, stolen, or factory-reset, the signing key is permanently destroyed.
+
+**Resolution**:
+- This is an intentional security property, not a flaw. A non-exportable key cannot be stolen from a backup.
+- Recovery procedure: revoke the lost device from the GTK GUI (`Revoke Device` → removes `clients/<device_id>/`). Re-provision a new device through the normal provisioning flow (new OTP QR on the GUI, new key pair generated on the replacement device).
+- The provisioning flow is designed to be repeatable and takes under two minutes.
+
+**Accepted limitation**: There is no backup for the signing key. This is the correct trade-off: exportable keys provide no meaningful security improvement over symmetric tokens, negating the entire asymmetric model. Users should be informed of this at provisioning time.
+
+---
+
 ## 13. Verification Plan
 
 ### 13.1 — TLS Security
@@ -1581,10 +1681,11 @@ print('All log lines verified.')
 wg show  # on both VPS and PC: must show handshake timestamp within last ~3 minutes
 
 # Step 2: Verify routing through tunnel
-ping -c 3 10.0.0.1  # from PC: must reach VPS wg0 interface
+ping -c 3 10.0.0.1  # from PC to VPS wg0 interface — must reach relay
+ping -c 3 10.0.0.2  # from VPS to PC wg0 interface — must reach daemon host
 
 # Step 3: Verify daemon is reachable through tunnel
-curl --cacert ca.crt https://10.0.0.1:7443/health  # must return 200
+curl --cacert ca.crt https://10.0.0.2:7443/health  # must return 200 (daemon on PC wg0)
 
 # Step 4: Verify TLS traffic invisible to relay
 # On VPS:
@@ -1618,7 +1719,7 @@ Both variants share 100% of the application code. The daemon (`bridge_v2.py`), t
 | Network with potentially hostile devices (ARP spoofing possible) | PAM (crypto model handles it) or PAM-hardened for extra isolation |
 | Network with AP isolation — devices cannot reach each other | **PAM-hardened required** |
 | Open public WiFi — untrusted infrastructure | **PAM-hardened required** |
-| Stable IP desired regardless of DHCP behavior | PAM-hardened (10.0.0.1 never changes) |
+| Stable IP desired regardless of DHCP behavior | PAM-hardened (10.0.0.2 never changes) |
 | No internet connectivity on PC at setup time | PAM |
 | Minimal infrastructure, no cloud dependency | PAM |
 | Maximum network-layer isolation | PAM-hardened |
@@ -1628,13 +1729,13 @@ Both variants share 100% of the application code. The daemon (`bridge_v2.py`), t
 | Property | PAM | PAM-hardened |
 |---|---|---|
 | **Daemon bind** | `<LAN_IP>:7443` | `10.0.0.2:7443` (wg0 PC side) |
-| **Server SAN** | `IP:<LAN_IP>, DNS:rofi-bridge.local` | `IP:10.0.0.1` |
-| **Client connects to** | `rofi-bridge.local:7443` or `<LAN_IP>:7443` | `10.0.0.1:7443` (via WireGuard tunnel) |
+| **Server SAN** | `IP:<LAN_IP>, DNS:rofi-bridge.local` | `IP:10.0.0.2` |
+| **Client connects to** | `rofi-bridge.local:7443` or `<LAN_IP>:7443` | `10.0.0.2:7443` (PC wg0, via WireGuard tunnel) |
 | **mDNS** | Optional | Disabled |
 | **Port** | 7443 | 7443 (inside tunnel) |
 | **External infra** | None | Oracle Free Tier VPS (WireGuard relay) |
 | **AP isolation resilience** | No | Yes |
-| **IP stability** | DHCP-dependent (mitigated by SAN+mDNS) | Always 10.0.0.1 |
+| **IP stability** | DHCP-dependent (mitigated by SAN+mDNS) | Always 10.0.0.2 (WireGuard static allocation) |
 | **Tunnel overhead** | None | ~60 bytes UDP WireGuard header per packet |
 | **Setup complexity** | Low | Medium (relay-setup.sh on VPS) |
 
@@ -1787,7 +1888,7 @@ Key rotation:
 │  │              │                      │                    │           │
 │  │ Flutter app  │────────────────────────────────────────────►          │
 │  │ HTTPS→       │    WireGuard tunnel (E2E encrypted)       │           │
-│  │ 10.0.0.1:7443│                                     bridge_v2.py      │
+│  │ 10.0.0.2:7443│                                     bridge_v2.py      │
 │  └──────────────┘                                    bound: 10.0.0.2    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1852,6 +1953,28 @@ Port 443 traffic is indistinguishable from standard HTTPS to a passive observer.
 **Why This Choice**
 
 Reducing operational fingerprint on untrusted networks decreases the likelihood of active targeting. A port 7443 service is obviously custom and invites probing; port 443 is expected to carry HTTPS traffic and blends into background noise.
+
+**Port Conflicts**
+
+Port 443 may already be bound by another service on the same machine — common examples: Home Assistant (default port 8123 or 443 via reverse proxy), Nextcloud, Plex, or any other HTTPS server. If a service already listens on TCP/443, `setup.sh --untrusted-mode` will detect the conflict and abort with an explicit error.
+
+Options when port 443 is unavailable:
+
+1. **Use port 8443**: Non-standard HTTPS port, less commonly blocked than 7443, still blends as HTTPS traffic. Set `port = 8443` in config.toml. Slightly higher fingerprinting risk than 443 but avoids all conflicts.
+2. **nginx reverse proxy**: Place nginx in front of PAM on the same host. nginx binds port 443 and proxies to PAM on 7443 (loopback). Requires nginx, adds a dependency, but allows coexistence with other virtual hosts on the same machine.
+
+```bash
+# nginx proxy_pass snippet (server block)
+location / {
+    proxy_pass https://127.0.0.1:7443;
+    proxy_ssl_certificate     /path/to/client.crt;
+    proxy_ssl_certificate_key /path/to/client.key;
+    proxy_ssl_trusted_certificate /path/to/ca.crt;
+    proxy_ssl_verify on;
+}
+```
+
+The default recommendation for untrusted-mode on a dedicated machine is port 443. On a machine running other services, 8443 is the preferred alternative.
 
 ---
 
@@ -1988,7 +2111,192 @@ TLS 1.3 handshakes on a modern CPU take ~0.5-2ms server-side (ECDHE + certificat
 
 ---
 
+---
+
+## 18. Implementation Notes — Critical Pitfalls
+
+This section documents implementation-time failure modes that are not obvious from the architecture description but have caused silent failures or security gaps in practice. Each pitfall includes the symptom, root cause, and the mitigation already incorporated in this design.
+
+---
+
+### 18.1 — Nonce Cache Volatility
+
+**Symptom**: After a daemon restart, replayed commands from within the previous ±30s window are accepted.
+
+**Root cause**: An in-memory nonce cache (dict, LRU, or deque) is cleared on every process exit. An attacker who captures a valid signed request can restart the daemon (requires local access or a crash trigger) and replay it within the timestamp window.
+
+**Mitigation in this design**: The nonce cache is stored in SQLite (`nonces.db`) in the same directory as server keys. Every accepted nonce is written to the database before the command is executed. On startup, the daemon purges entries older than 5 minutes (TTL) and loads the remaining valid set into memory. The in-memory cache is authoritative at runtime; the database is the persistence layer.
+
+```python
+# On nonce check (simplified)
+def check_and_store_nonce(nonce: str, ts: float) -> bool:
+    with sqlite3.connect(NONCE_DB) as db:
+        try:
+            db.execute("INSERT INTO nonces (nonce, ts) VALUES (?, ?)", (nonce, ts))
+            db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False  # duplicate — replay
+
+# On startup
+def purge_expired_nonces():
+    cutoff = time.time() - 300  # 5 minutes
+    with sqlite3.connect(NONCE_DB) as db:
+        db.execute("DELETE FROM nonces WHERE ts < ?", (cutoff,))
+        db.commit()
+```
+
+The `nonces` table has a UNIQUE constraint on the `nonce` column. Insertion failure indicates a replay.
+
+---
+
+### 18.2 — setcap Fragility After System Updates
+
+**Symptom**: After a system package update that replaces the `ipt-helper` binary, iptables commands silently fail. The daemon starts successfully but cannot open or close ports.
+
+**Root cause**: Linux capabilities (`cap_net_admin+eip`) are stored as extended attributes on the binary inode. When a package manager overwrites the binary with a new inode (even if the content is identical), the extended attributes are gone. The daemon does not detect this at startup — it only fails when `ipt-helper` is actually invoked.
+
+**Mitigation in this design**: `pam-setcap.service` is a systemd oneshot unit that runs at every boot, before `rofi-bridge.service`. It checks whether the capability is present and re-applies it if not:
+
+```ini
+[Unit]
+Description=PAM ipt-helper capability guard
+Before=rofi-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'getcap /usr/lib/rofi-bridge/ipt-helper | grep -q cap_net_admin || setcap cap_net_admin+eip /usr/lib/rofi-bridge/ipt-helper'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
+```
+
+`setup.sh` installs and enables this unit as part of the setup procedure. This makes setcap application idempotent across system updates.
+
+---
+
+### 18.3 — CA Key Online During Runtime
+
+**Symptom**: If `ca.key` remains accessible on the filesystem while the daemon is running, a compromise of the daemon process yields the CA key, allowing issuance of arbitrary client certificates.
+
+**Root cause**: The CA key is only needed during provisioning (to sign client TLS certificates). Keeping it readable by the daemon process at runtime is unnecessary privilege.
+
+**Mitigation in this design**: `setup.sh` encrypts the CA key with AES-256 immediately after CA generation (`openssl pkcs8 -topk8 -v2 aes-256-cbc`) and moves the encrypted file to `~/pam-ca/ca.key.enc`, outside the daemon's working directory. The plaintext key is shredded (`shred -u ca.key`). Provisioning operations (signing new client certs) are performed by `gui_gtk.c`, which prompts for the CA key passphrase at provisioning time. The daemon (`bridge_v2.py`) never reads or needs the CA key.
+
+---
+
+### 18.4 — Server Certificate SAN Mismatch
+
+**Symptom**: TLS handshake fails with `certificate verify failed: hostname mismatch` on the Android app, even though the CA is trusted.
+
+**Root cause**: TLS clients verify that the server certificate's Subject Alternative Names include the address they connected to. If the SAN lists a hostname (`rofi-bridge.local`) but the app connects by IP, or lists a different IP than the one used, verification fails.
+
+**Requirements**:
+- **PAM**: SAN must include both `DNS:rofi-bridge.local` (for mDNS) and `IP:<LAN_IP>` (for direct IP connections and untrusted mode where mDNS is disabled).
+- **PAM-hardened**: SAN must include `IP:10.0.0.2` (PC WireGuard interface). The LAN IP is not used because the app connects through the tunnel to the WireGuard address.
+
+`setup.sh` generates the SAN extension automatically based on the detected LAN IP and hostname. The `--hardened` flag switches the SAN to `IP:10.0.0.2`. Regenerating the server certificate (and re-provisioning all clients) is required whenever the machine's IP changes.
+
+---
+
+### 18.5 — Port 443 Binding Without Capability
+
+**Symptom**: Daemon fails to start with `PermissionError: [Errno 13] Permission denied` when `port = 443` is set in config.toml.
+
+**Root cause**: On Linux, binding to ports below 1024 requires `CAP_NET_BIND_SERVICE`. The Python interpreter does not have this capability by default. Running the daemon as root to work around this is not acceptable.
+
+**Mitigation in this design**: `setup.sh --untrusted-mode` installs an iptables PREROUTING/OUTPUT redirect rule that maps TCP/443 to TCP/7443, so the daemon continues to bind on 7443 and the kernel redirects traffic transparently:
+
+```bash
+iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-port 7443
+iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 7443
+```
+
+These rules are persisted via `iptables-save` or `nftables` equivalent and restored at boot. This avoids granting `CAP_NET_BIND_SERVICE` to the Python process.
+
+---
+
+## 19. Comparison with Existing Solutions
+
+This section compares PAM with commonly used alternatives for remote execution from a mobile device. The comparison is based on the specific requirements: low-latency command dispatch, zero-install infrastructure, hardware-backed authentication, and operation on untrusted networks.
+
+---
+
+### 19.1 — Comparison Table
+
+| Criterion | PAM | SSH + Key | Tailscale + SSH | Home Assistant | Tasker + HTTP |
+|---|---|---|---|---|---|
+| **Authentication** | mTLS + Ed25519 HW Keystore | SSH key (software, exportable) | SSH key + Tailscale ACL | Username/password or token | Bearer token or none |
+| **Key storage** | Android Keystore (hardware-backed, non-exportable) | Filesystem (exportable) or software keychain | Filesystem (exportable) | Credential store (varies) | Plaintext or base64 |
+| **Transport** | TLS 1.3, ECDHE, forward secrecy | SSH (OpenSSH cipher negotiation) | Wireguard (Tailscale) + SSH | HTTPS (Let's Encrypt) | HTTP or HTTPS |
+| **mTLS** | Yes — bidirectional cert verification | No | No | No | No |
+| **Replay protection** | Timestamp + persistent nonce cache (SQLite) | Implicit (SSH session state) | Implicit (SSH session state) | No | No |
+| **Audit log** | Append-only, HMAC per line, server signing key | sshd logs (not integrity-protected) | sshd logs | HA logs (not integrity-protected) | None |
+| **Privilege model** | setcap on C binary, zero sudoers | Full shell access by default | Full shell access by default | Root/sudo via scripts | subprocess.Popen |
+| **Command whitelist** | Enum-validated, zero free-form execution | None — arbitrary shell access | None — arbitrary shell access | Configurable automations | None |
+| **AP isolation bypass** | PAM-hardened: WireGuard relay | No (requires direct access) | Yes (Tailscale relay network) | Requires public exposure | No |
+| **Mobile client** | Custom Flutter app, purpose-built | SSH client app (Termius, JuiceSSH, etc.) | Tailscale app + SSH client | HA mobile app | Tasker plugin |
+| **Infrastructure** | Self-hosted daemon + optional VPS relay | Self-hosted SSH server | Tailscale relay network (SaaS) | Self-hosted HA instance | Self-hosted HTTP server |
+| **Setup complexity** | High (CA, certs, setcap, provisioning) | Low (ssh-keygen, authorized_keys) | Medium (Tailscale account + install) | High (HA install + automations) | Low (HTTP server + token) |
+| **Open source / self-contained** | Yes — no external SaaS dependencies in PAM | Yes | Partially (Tailscale relay is proprietary SaaS) | Yes | Yes |
+| **Network exposure** | Port 7443/443 on LAN only (or WG tunnel) | Port 22 on LAN (or internet if forwarded) | WireGuard to Tailscale relays | Port 8123/443 on LAN or internet | Port varies |
+
+---
+
+### 19.2 — SSH + Key
+
+**Why it is not used**: SSH gives unrestricted shell access. There is no built-in command whitelist, no per-command audit log with cryptographic integrity, no hardware-backed key requirement, and no replay protection beyond TCP session state. An SSH key stored in a software keychain on Android is exportable from a rooted device. SSH also exposes a full interactive shell — the threat model is significantly broader than a whitelist of discrete commands.
+
+**Where SSH is appropriate**: When full remote shell access is the requirement (development, system administration). PAM is not a replacement for SSH — it is a purpose-built command dispatcher with a narrower, more constrained interface.
+
+---
+
+### 19.3 — Tailscale + SSH
+
+**Strengths**: Tailscale provides a WireGuard-based overlay network with MagicDNS, handles NAT traversal automatically (including AP isolation bypass via DERP relays), and integrates with ACL policies. The VPN layer is solid.
+
+**Why it is not used**:
+- Tailscale relay infrastructure is proprietary SaaS. The DERP relay layer is partially open source but the coordination server is not. Traffic metadata is visible to Tailscale.
+- Still provides full SSH shell access — same command-whitelist and audit concerns as plain SSH.
+- Requires a Tailscale account and an internet-facing coordination server. PAM-hardened requires only a standard VPS and standard WireGuard (kernel module, no SaaS dependency).
+- Key management is handled by Tailscale's PKI, not hardware-backed device keys.
+
+**Where Tailscale is appropriate**: When the goal is secure remote access to a home network for general use. PAM-hardened solves a narrower problem (authenticated command dispatch) with stronger guarantees on the authentication layer.
+
+---
+
+### 19.4 — Home Assistant
+
+**Strengths**: Mature ecosystem, mobile app, support for complex automations, active community.
+
+**Why it is not used**: Home Assistant is a home automation platform, not a command dispatcher. Using it as a remote execution layer for arbitrary system commands (iptables, network management) requires running scripts or shell commands as automations — which reintroduces unconstrained execution. Authentication in HA uses long-lived access tokens stored in the mobile app credential store, not hardware-backed keys. There is no per-command signing. Audit logging is a general-purpose event log, not an integrity-protected record.
+
+**Where Home Assistant is appropriate**: Home automation use cases (lights, sensors, smart devices). For system-level command dispatch with a strong security model, it is not the right layer.
+
+---
+
+### 19.5 — Tasker + HTTP
+
+**Why it is not used**: No authentication model beyond a bearer token in plaintext or base64. No mTLS. No command signing. No replay protection. Intended for local automation, not for use over untrusted networks. Mentioned only for completeness — not a serious alternative for the threat model addressed by PAM.
+
+---
+
+### 19.6 — Design Rationale Summary
+
+PAM occupies a specific position: it is the correct tool when the requirement is **authenticated, audited, whitelisted command dispatch from a mobile device**, with a threat model that includes:
+
+- Untrusted LAN or public WiFi (PAM-hardened)
+- Hardware-backed device authentication with non-exportable keys
+- Zero trust at every layer — no shared secrets, no implicit trust from network position
+- Minimal privilege — the daemon cannot execute arbitrary code, only a fixed enum of commands
+- Cryptographic audit trail — log entries are signed, not just recorded
+
+No existing off-the-shelf tool satisfies all of these simultaneously. SSH provides shell access but not the constrained interface. Tailscale provides the network layer but not the authentication model. Home Assistant provides the mobile UX but not the security model. PAM is a purpose-built composition of well-established primitives (TLS, mTLS, Ed25519, WireGuard, SQLite) assembled to address a specific threat model.
+
+---
+
 *Document generated from security analysis sessions, 2026-03-17.*
 *Version 1.0: Core architecture (20 security problems, full asymmetric model).*
 *Version 2.0: Extended with deployment variants, network threat categories, PAM-hardened WireGuard architecture, untrusted network mitigations.*
-*All design decisions recorded verbatim from technical discussion.*
+*Version 3.0 (2026-03-18): WireGuard topology correction (PC wg0 = 10.0.0.2, VPS = 10.0.0.1 routing hub only). Added: nonce cache SQLite persistence (C1), pam-setcap.service guard (C2), Flutter VPS fallback logic (C3), NTP prerequisite check (C4), PC sleep/WoL limitation (R8), Android key non-exportability (R9), port 443 conflict handling and 8443 alternative (Section 17.1), Section 18 (Implementation Pitfalls), Section 19 (Comparison with existing solutions).*
