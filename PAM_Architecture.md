@@ -976,22 +976,26 @@ Step 1: Certificate Authority
   openssl genrsa -out ca.key 4096
   openssl req -x509 -new -key ca.key -out ca.crt -days 3650
       -subj "/CN=PAM-CA-$(hostname)"
-  openssl pkcs8 -in ca.key -topk8 -out ~/rofi-bridge-ca/ca.key.enc
-      -passout pass:"$(openssl rand -base64 32)"
+  # Sign server cert with PLAINTEXT ca.key BEFORE encrypting (see Step 2).
+  # After signing: encrypt, then shred plaintext.
+  openssl pkcs8 -in ca.key -topk8 -v2 aes256 -out ~/rofi-bridge-ca/ca.key.enc
   shred -u ca.key
   # ca.key.enc → OFFLINE, never read by daemon
 
 Step 2: Server Certificate (with SAN)
+  # NOTE: sign with plaintext ca.key while it still exists (before Step 1 shred).
+  # For --regenerate-server-cert (key already encrypted), setup.sh decrypts to a
+  # temporary file (mktemp, chmod 600), signs, then shreds the temp file.
   LAN_IP=$(ip route get 8.8.8.8 | awk '{print $7; exit}')
   HOSTNAME=$(hostname)
   openssl genrsa -out server.key 2048
   openssl req -new -key server.key -out server.csr
       -subj "/CN=rofi-bridge/O=PAM"
-  # Generate san.ext with IP.1=$LAN_IP, IP.2=127.0.0.1,
-  #   DNS.1=rofi-bridge.local, DNS.2=$HOSTNAME.local
-  openssl x509 -req -in server.csr -CA ca.crt -CAkey ~/rofi-bridge-ca/ca.key.enc
-      -CAcreateserial -extfile san.ext -extensions v3_req
+  # Generate san.ext: [SAN] subjectAltName=IP:$LAN_IP,DNS:$HOSTNAME.local
+  openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key
+      -CAcreateserial -extfile san.ext -extensions SAN
       -out server.crt -days 365
+  # (ca.key still plaintext here — shred happens at end of Step 1)
 
 Step 3: Privilege Helper
   gcc -O2 -o ipt-helper ipt-helper.c
@@ -1124,9 +1128,16 @@ Server (/provision handler):
   11. Generates device_id = SHA-256(sign_pub)[:16]
   12. Generates client TLS key pair + certificate:
       openssl genrsa -out clients/<device_id>/tls.key 2048
-      openssl req -new -key tls.key -subj "/CN=<device_id>/O=PAM-client"
-      openssl x509 -req -CA ca.crt -CAkey ca.key.enc
+      openssl req -new -key clients/<device_id>/tls.key \
+          -out clients/<device_id>/tls.csr \
+          -subj "/CN=<device_id>/O=PAM-client"
+      # ca.key.enc decrypted to temp file using passphrase from pending_otps.json,
+      # used for signing, then shredded immediately.
+      openssl x509 -req -in clients/<device_id>/tls.csr \
+          -CA ca.crt -CAkey <tmp_ca_key> \
+          -CAcreateserial -days 365 \
           -out clients/<device_id>/tls.crt
+      shred -u <tmp_ca_key>
   13. Saves sign.pub to clients/<device_id>/sign.pub
   14. Responds with:
       { "ca_cert": "<ca.crt PEM>",
@@ -1960,21 +1971,26 @@ Port 443 may already be bound by another service on the same machine — common 
 
 Options when port 443 is unavailable:
 
-1. **Use port 8443**: Non-standard HTTPS port, less commonly blocked than 7443, still blends as HTTPS traffic. Set `port = 8443` in config.toml. Slightly higher fingerprinting risk than 443 but avoids all conflicts.
-2. **nginx reverse proxy**: Place nginx in front of PAM on the same host. nginx binds port 443 and proxies to PAM on 7443 (loopback). Requires nginx, adds a dependency, but allows coexistence with other virtual hosts on the same machine.
+1. **Use port 8443**: Non-standard HTTPS port, less commonly blocked than 7443, still blends as HTTPS traffic. Set `port = 8443` in config.toml. Slightly higher fingerprinting risk than 443 but avoids all conflicts. **This is the recommended option when port 443 is unavailable.**
+2. **nginx TCP stream passthrough**: nginx listens on port 443 and forwards raw TCP to PAM on 7443. The TLS session is end-to-end between Android and PAM — nginx is a transparent pipe. mTLS is fully preserved.
 
-```bash
-# nginx proxy_pass snippet (server block)
-location / {
-    proxy_pass https://127.0.0.1:7443;
-    proxy_ssl_certificate     /path/to/client.crt;
-    proxy_ssl_certificate_key /path/to/client.key;
-    proxy_ssl_trusted_certificate /path/to/ca.crt;
-    proxy_ssl_verify on;
+```nginx
+# /etc/nginx/nginx.conf — add at top level, OUTSIDE the http {} block
+# Requires ngx_stream_core_module (standard since nginx 1.9.0)
+stream {
+    server {
+        listen 443;
+        proxy_pass 127.0.0.1:7443;
+    }
 }
 ```
 
-The default recommendation for untrusted-mode on a dedicated machine is port 443. On a machine running other services, 8443 is the preferred alternative.
+> **WARNING — do NOT use HTTP `proxy_pass` (layer 7) with PAM.**
+> An `http { location / { proxy_pass https://127.0.0.1:7443; } }` block terminates the TLS session at nginx. nginx opens a *separate* TLS connection to the backend — the Android client certificate is never forwarded to the daemon. The daemon sees nginx's certificate instead, breaking device identity verification (Layer 2 — mTLS) and the entire `device_id` extraction chain. The system silently degrades to Layer 3 only (Ed25519 signature), which violates the defence-in-depth model.
+
+**Limitation of stream passthrough**: because nginx does not inspect TLS, it cannot route by SNI. Port 443 can only forward to one backend. If multiple services must share port 443, use port 8443 for PAM instead.
+
+The default recommendation for untrusted-mode on a dedicated machine is port 443 (iptables redirect). On a machine running other HTTPS services, **8443 is the preferred alternative**.
 
 ---
 
@@ -2182,7 +2198,7 @@ WantedBy=default.target
 
 **Root cause**: The CA key is only needed during provisioning (to sign client TLS certificates). Keeping it readable by the daemon process at runtime is unnecessary privilege.
 
-**Mitigation in this design**: `setup.sh` encrypts the CA key with AES-256 immediately after CA generation (`openssl pkcs8 -topk8 -v2 aes-256-cbc`) and moves the encrypted file to `~/pam-ca/ca.key.enc`, outside the daemon's working directory. The plaintext key is shredded (`shred -u ca.key`). Provisioning operations (signing new client certs) are performed by `gui_gtk.c`, which prompts for the CA key passphrase at provisioning time. The daemon (`bridge_v2.py`) never reads or needs the CA key.
+**Mitigation in this design**: `setup.sh` signs the server certificate with the plaintext CA key *before* encrypting it, then immediately encrypts (`openssl pkcs8 -topk8 -v2 aes256`) and moves the encrypted file to `~/rofi-bridge-ca/ca.key.enc`, outside the daemon's working directory. The plaintext key is shredded (`shred -u ca.key`). Provisioning operations (signing new client certs) are performed by `gui_gtk.c`, which prompts for the CA key passphrase at provisioning time. The daemon (`bridge_v2.py`) never reads or needs the CA key.
 
 ---
 
