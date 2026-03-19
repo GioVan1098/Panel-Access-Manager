@@ -126,6 +126,18 @@ def init_nonce_db() -> None:
         db.commit()
 
 
+def _nonce_cleanup_loop() -> None:
+    """Background thread: periodically purge expired nonces."""
+    while True:
+        time.sleep(NONCE_TTL)
+        try:
+            with sqlite3.connect(NONCE_DB) as db:
+                db.execute("DELETE FROM nonces WHERE ts < ?", (time.time() - NONCE_TTL,))
+                db.commit()
+        except Exception:
+            pass
+
+
 def check_and_store_nonce(nonce: str, ts: float) -> bool:
     """Returns True if nonce is new (not a replay)."""
     with _nonce_lock:
@@ -311,12 +323,14 @@ def provision_client(device_id: str, ed25519_pubkey_b64: str, ca_pass: str) -> d
              "-subj", f"/CN={device_id}/O=PAM-client"],
             check=True, capture_output=True,
         )
+        sign_env = os.environ.copy()
+        sign_env["_CAPASS"] = ca_pass
         subprocess.run(
             ["openssl", "x509", "-req", "-in", csr_path,
              "-CA", CA_CRT, "-CAkey", CA_KEY_ENC,
-             "-passin", f"pass:{ca_pass}",
+             "-passin", "env:_CAPASS",
              "-CAcreateserial", "-out", crt_path, "-days", "365"],
-            check=True, capture_output=True,
+            check=True, capture_output=True, env=sign_env,
         )
 
         with open(key_path) as f:
@@ -347,7 +361,8 @@ def execute_command(cmd: str) -> tuple[int, str]:
         return 400, "Unknown command"
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-        return r.returncode, (r.stdout + r.stderr).strip()
+        out = (r.stdout + r.stderr).strip()
+        return r.returncode, out[:10000]
     except subprocess.TimeoutExpired:
         return 1, "Command timed out"
     except FileNotFoundError as e:
@@ -607,6 +622,9 @@ def main() -> None:
 
     config    = load_config()
     port      = int(config.get("port", 7443))
+    if not (1 <= port <= 65535):
+        logging.error("Invalid port %d in config — using 7443", port)
+        port = 7443
     bind      = str(config.get("bind", "")).strip()
     mode      = str(config.get("mode", "direct"))
     untrusted = bool(config.get("untrusted", False))
@@ -635,6 +653,7 @@ def main() -> None:
         logging.warning("audit_key missing — HMAC not persistent across restarts")
 
     init_nonce_db()
+    threading.Thread(target=_nonce_cleanup_loop, daemon=True).start()
 
     # SSL context — CERT_OPTIONAL allows /provision without a client cert
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

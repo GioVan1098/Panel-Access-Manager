@@ -35,8 +35,10 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
     try {
       final qr = jsonDecode(raw) as Map<String, dynamic>;
       final otp = qr['otp'] as String;
-      final serverIp = qr['ip'] as String;
-      final port = (qr['port'] as num?)?.toInt() ?? 7443;
+      final addr = qr['addr'] as String;
+      final lastColon = addr.lastIndexOf(':');
+      final serverIp = addr.substring(0, lastColon);
+      final port = int.tryParse(addr.substring(lastColon + 1)) ?? 7443;
       final fp = qr['fp'] as String;
 
       // Ensure device_id exists (persisted across re-provisioning)
