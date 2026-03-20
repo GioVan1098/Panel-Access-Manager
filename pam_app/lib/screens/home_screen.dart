@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../models/command.dart';
 import '../models/config.dart';
 import '../services/crypto_service.dart';
@@ -76,7 +77,10 @@ class _HomeScreenState extends State<HomeScreen> {
       final ts = _crypto.currentTimestamp();
       final nonce = _crypto.generateNonce();
       final payload = _crypto.buildCanonicalPayload(cmd.wireValue, ts, nonce);
-      final sig = await _crypto.signPayload(_config.deviceId, payload);
+      final biometricEnabled = await _storage.getBiometricAuthEnabled();
+      final sig = biometricEnabled
+          ? await _crypto.signPayloadWithBiometric(_config.deviceId, payload)
+          : await _crypto.signPayload(_config.deviceId, payload);
 
       final body = _crypto.buildCommandBody(
         command: cmd.wireValue,
@@ -105,6 +109,12 @@ class _HomeScreenState extends State<HomeScreen> {
           _notify('Bad request — check clock sync', error: true);
         default:
           _notify('Unexpected status: $status', error: true);
+      }
+    } on PlatformException catch (e) {
+      if (e.code == 'BIOMETRIC_CANCELLED') {
+        _notify('Cancelled');
+      } else {
+        _notify(e.message ?? e.code, error: true);
       }
     } catch (e) {
       _notify('$e', error: true);

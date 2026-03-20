@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../models/config.dart';
+import '../services/keystore_service.dart';
 import '../services/storage_service.dart';
 import 'provisioning_screen.dart';
 
@@ -12,11 +13,15 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   final _storage = StorageService();
+  final _keystore = KeystoreService();
   final _ipController = TextEditingController();
   final _portController = TextEditingController(text: '7443');
   PamMode _mode = PamMode.direct;
   bool _provisioned = false;
   String _deviceId = '';
+  bool _biometricEnabled = false;
+  bool _biometricAvailable = false;
+  String _biometricStatus = 'UNKNOWN';
 
   @override
   void initState() {
@@ -30,13 +35,38 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final mode = await _storage.getMode();
     final provisioned = await _storage.isProvisioned();
     final deviceId = await _storage.getDeviceId();
+    final biometricEnabled = await _storage.getBiometricAuthEnabled();
+    Map<String, dynamic> availability = {};
+    try {
+      availability = await _keystore.getBiometricAvailability();
+    } catch (_) {}
     setState(() {
       _ipController.text = ip ?? '';
       _portController.text = port.toString();
       _mode = mode == 'hardened' ? PamMode.hardened : PamMode.direct;
       _provisioned = provisioned;
       _deviceId = deviceId ?? '';
+      _biometricEnabled = biometricEnabled;
+      _biometricAvailable =
+          availability['any_auth_available'] as bool? ?? false;
+      _biometricStatus =
+          availability['biometric_status'] as String? ?? 'UNKNOWN';
     });
+  }
+
+  String _biometricUnavailableMessage() {
+    switch (_biometricStatus) {
+      case 'NO_HARDWARE':
+        return 'No biometric hardware on this device';
+      case 'HW_UNAVAILABLE':
+        return 'Biometric hardware temporarily unavailable';
+      case 'NONE_ENROLLED':
+        return 'No biometrics enrolled — add fingerprint or face in Android settings';
+      case 'SECURITY_UPDATE_REQUIRED':
+        return 'Security update required before biometrics can be used';
+      default:
+        return 'Biometric authentication not available';
+    }
   }
 
   Future<void> _save() async {
@@ -118,6 +148,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ],
           ),
           const SizedBox(height: 24),
+          const Divider(),
+          SwitchListTile(
+            secondary: Icon(
+              Icons.fingerprint,
+              color: _biometricAvailable
+                  ? Theme.of(context).colorScheme.primary
+                  : Colors.grey,
+            ),
+            title: const Text('Require biometric for commands'),
+            subtitle: Text(
+              _biometricAvailable
+                  ? (_biometricEnabled
+                      ? 'Fingerprint / face / PIN required to send commands'
+                      : 'Tap to enable biometric confirmation')
+                  : _biometricUnavailableMessage(),
+              style: TextStyle(
+                color: _biometricAvailable ? null : Colors.grey,
+              ),
+            ),
+            value: _biometricEnabled && _biometricAvailable,
+            onChanged: _biometricAvailable
+                ? (v) async {
+                    await _storage.setBiometricAuthEnabled(v);
+                    setState(() => _biometricEnabled = v);
+                  }
+                : null,
+          ),
           const Divider(),
           ListTile(
             leading: Icon(

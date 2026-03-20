@@ -43,18 +43,48 @@ done
 
 # ── Uninstall ─────────────────────────────────────────────────────────────
 if [ "$UNINSTALL" -eq 1 ]; then
-    info "Uninstalling PAM services..."
-    systemctl --user stop    rofi-bridge.service  2>/dev/null || true
-    systemctl --user disable rofi-bridge.service  2>/dev/null || true
+    info "Uninstalling PAM..."
+
+    # ── Daemon service (user) ─────────────────────────────────────────
+    systemctl --user stop    rofi-bridge.service 2>/dev/null || true
+    systemctl --user disable rofi-bridge.service 2>/dev/null || true
     systemctl --user daemon-reload
-    sudo systemctl stop    pam-setcap.service    2>/dev/null || true
-    sudo systemctl disable pam-setcap.service    2>/dev/null || true
+    rm -f "${SERVICE_DIR}/rofi-bridge.service"
+    ok "rofi-bridge.service removed"
+
+    # ── pam-setcap.service (system) ───────────────────────────────────
+    sudo systemctl stop    pam-setcap.service 2>/dev/null || true
+    sudo systemctl disable pam-setcap.service 2>/dev/null || true
     sudo rm -f /etc/systemd/system/pam-setcap.service
     sudo systemctl daemon-reload
-    rm -f "${SERVICE_DIR}/rofi-bridge.service"
-    ok "Services removed."
-    ok "Config retained at: ${CONFIG_DIR}/"
-    ok "To also remove data: rm -rf '${CONFIG_DIR}' '${CA_DIR}'"
+    ok "pam-setcap.service removed"
+
+    # ── ipt-helper binary ─────────────────────────────────────────────
+    if [ -f "${IPT_BIN}" ]; then
+        sudo rm -f "${IPT_BIN}"
+        sudo rmdir "$(dirname "${IPT_BIN}")" 2>/dev/null || true
+        ok "ipt-helper removed"
+    fi
+
+    # ── GUI binary ────────────────────────────────────────────────────
+    if [ -f "${HOME}/.local/bin/pam-gui" ]; then
+        rm -f "${HOME}/.local/bin/pam-gui"
+        ok "pam-gui removed"
+    fi
+
+    # ── WireGuard (hardened mode only) ────────────────────────────────
+    if [ -f /etc/wireguard/wg0.conf ]; then
+        info "WireGuard configuration found — removing..."
+        sudo systemctl stop    wg-quick@wg0 2>/dev/null || true
+        sudo systemctl disable wg-quick@wg0 2>/dev/null || true
+        sudo rm -f /etc/wireguard/wg0.conf
+        ok "WireGuard wg0 removed"
+    fi
+
+    ok "PAM uninstalled."
+    warn "Config and certificates retained at: ${CONFIG_DIR}/"
+    warn "CA key retained at: ${CA_DIR}/"
+    warn "To also remove data: rm -rf '${CONFIG_DIR}' '${CA_DIR}'"
     exit 0
 fi
 

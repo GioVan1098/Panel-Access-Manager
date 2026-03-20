@@ -36,4 +36,22 @@ class KeystoreService {
   Future<void> deleteKey(String alias) async {
     await _channel.invokeMethod('deleteKey', {'alias': alias});
   }
+
+  Future<String> signWithBiometric(String alias, Uint8List data) async {
+    final sig = await _channel.invokeMethod<String>(
+      'signWithBiometric',
+      {'alias': alias, 'data': data},
+    );
+    return sig!;
+  }
+
+  Future<Map<String, dynamic>> checkDeviceIntegrity() async {
+    final result = await _channel.invokeMethod<Map>('checkDeviceIntegrity');
+    return Map<String, dynamic>.from(result ?? {});
+  }
+
+  Future<Map<String, dynamic>> getBiometricAvailability() async {
+    final result = await _channel.invokeMethod<Map>('getBiometricAvailability');
+    return Map<String, dynamic>.from(result ?? {});
+  }
 }

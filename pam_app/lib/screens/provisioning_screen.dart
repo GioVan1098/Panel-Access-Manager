@@ -27,6 +27,45 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
   Future<void> _handleQr(String raw) async {
     if (_processing) return;
     _processing = true;
+
+    // Device integrity check before provisioning
+    try {
+      final integrity = await _keystore.checkDeviceIntegrity();
+      final warnLevel = integrity['warning_level'] as String? ?? 'NONE';
+      if (warnLevel != 'NONE' && mounted) {
+        final secLevel = integrity['security_level'] as String? ?? 'UNKNOWN';
+        final msg = warnLevel == 'HIGH'
+            ? 'No Trusted Execution Environment detected — keys will be stored in software ($secLevel). '
+                'Commands may be less secure on this device.'
+            : 'This device uses a test-keys firmware build, which may indicate modified system software. '
+                'Ed25519 keys are still hardware-backed.';
+        final proceed = await showDialog<bool>(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: Text(warnLevel == 'HIGH' ? 'Security Warning' : 'Device Notice'),
+            content: Text(msg),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: Text(
+                    warnLevel == 'HIGH' ? 'Proceed anyway' : 'Continue'),
+              ),
+            ],
+          ),
+        );
+        if (proceed != true) {
+          _processing = false;
+          return;
+        }
+      }
+    } catch (_) {
+      // Integrity check failure is non-blocking
+    }
+
     setState(() {
       _scanning = false;
       _status = 'Provisioning…';

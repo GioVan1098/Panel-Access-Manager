@@ -23,6 +23,11 @@ class CryptoService {
     return _keystore.sign(alias, bytes);
   }
 
+  Future<String> signPayloadWithBiometric(String alias, String payload) {
+    final bytes = Uint8List.fromList(utf8.encode(payload));
+    return _keystore.signWithBiometric(alias, bytes);
+  }
+
   Map<String, dynamic> buildCommandBody({
     required String command,
     required String deviceId,

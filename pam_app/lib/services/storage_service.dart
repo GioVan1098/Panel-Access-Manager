@@ -13,6 +13,7 @@ class StorageService {
   static const _keyTlsCert = 'tls_crt';
   static const _keyTlsKey = 'tls_key';
   static const _keyProvisioned = 'provisioned';
+  static const _keyBiometricAuth = 'biometric_auth';
 
   Future<String?> getDeviceId() => _storage.read(key: _keyDeviceId);
   Future<void> setDeviceId(String v) => _storage.write(key: _keyDeviceId, value: v);
@@ -42,6 +43,11 @@ class StorageService {
       await _storage.read(key: _keyProvisioned) == 'true';
   Future<void> setProvisioned(bool v) =>
       _storage.write(key: _keyProvisioned, value: v.toString());
+
+  Future<bool> getBiometricAuthEnabled() async =>
+      await _storage.read(key: _keyBiometricAuth) == 'true';
+  Future<void> setBiometricAuthEnabled(bool v) =>
+      _storage.write(key: _keyBiometricAuth, value: v.toString());
 
   Future<void> clearAll() => _storage.deleteAll();
 }
