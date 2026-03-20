@@ -25,10 +25,14 @@ class MainActivity : FlutterFragmentActivity() {
 
     private val channel = "com.giovanni.pam/keystore"
 
-    // State for pending async biometric sign
+    // State for pending async soft-gate biometric sign
     private var pendingSignResult: MethodChannel.Result? = null
     private var pendingSignAlias: String? = null
     private var pendingSignData: ByteArray? = null
+
+    // State for pending async hard-gate biometric sign (CryptoObject)
+    private var pendingHardGateResult: MethodChannel.Result? = null
+    private var pendingHardGateData: ByteArray? = null
 
     // ── FLAG_SECURE: block screenshots, screen recording, screen sharing ──
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -46,6 +50,10 @@ class MainActivity : FlutterFragmentActivity() {
                             val alias = call.argument<String>("alias")!!
                             result.success(generateKeyPair(alias))
                         }
+                        "generateKeyPairHardened" -> {
+                            val alias = call.argument<String>("alias")!!
+                            result.success(generateKeyPairHardened(alias))
+                        }
                         "sign" -> {
                             val alias = call.argument<String>("alias")!!
                             val data = call.argument<ByteArray>("data")!!
@@ -56,6 +64,13 @@ class MainActivity : FlutterFragmentActivity() {
                             val data = call.argument<ByteArray>("data")!!
                             // Async: result will be completed in the BiometricPrompt callback
                             signWithBiometric(alias, data, result)
+                            return@setMethodCallHandler
+                        }
+                        "signWithBiometricHardGate" -> {
+                            val alias = call.argument<String>("alias")!!
+                            val data = call.argument<ByteArray>("data")!!
+                            // Async hard-gate: TEE-enforced, CryptoObject-bound
+                            signWithBiometricHardGate(alias, data, result)
                             return@setMethodCallHandler
                         }
                         "getPublicKey" -> {
@@ -92,6 +107,43 @@ class MainActivity : FlutterFragmentActivity() {
 
         fun buildSpec(strongBox: Boolean): KeyGenParameterSpec {
             val b = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+            if (strongBox) b.setIsStrongBoxBacked(true)
+            return b.build()
+        }
+
+        val keyPair = try {
+            kpg.initialize(buildSpec(strongBox = true))
+            kpg.generateKeyPair()
+        } catch (e: StrongBoxUnavailableException) {
+            kpg.initialize(buildSpec(strongBox = false))
+            kpg.generateKeyPair()
+        }
+
+        return Base64.encodeToString(keyPair.public.encoded, Base64.NO_WRAP)
+    }
+
+    /**
+     * Generate a key pair with TEE-level biometric authentication required.
+     *
+     * Unlike [generateKeyPair], the private key cannot be used without a
+     * successful biometric (BIOMETRIC_STRONG) event at the time of signing.
+     * This is enforced in hardware by the TEE/StrongBox — the key never
+     * leaves secure storage and the Signature object is handed back via
+     * CryptoObject after the TEE validates the biometric event.
+     *
+     * Flags:
+     *   - setUserAuthenticationRequired(true): TEE refuses signing without auth
+     *   - setUserAuthenticationValidityDurationSeconds(-1): per-use (not timeout)
+     *   - setInvalidatedByBiometricEnrollment(true): new biometrics void the key
+     */
+    private fun generateKeyPairHardened(alias: String): String {
+        val kpg = KeyPairGenerator.getInstance("Ed25519", "AndroidKeyStore")
+
+        fun buildSpec(strongBox: Boolean): KeyGenParameterSpec {
+            val b = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                .setUserAuthenticationRequired(true)
+                .setUserAuthenticationValidityDurationSeconds(-1)
+                .setInvalidatedByBiometricEnrollment(true)
             if (strongBox) b.setIsStrongBoxBacked(true)
             return b.build()
         }
@@ -180,6 +232,78 @@ class MainActivity : FlutterFragmentActivity() {
         )
 
         biometricPrompt.authenticate(promptInfo)
+    }
+
+    /**
+     * Sign with biometric hard-gate (TEE-level CryptoObject enforcement):
+     * - Signature object is initialized with the private key BEFORE the prompt
+     * - BiometricPrompt receives the Signature wrapped in a CryptoObject
+     * - TEE completes the signing only after biometric success
+     * - Cannot be bypassed in software: the TEE will not sign without auth
+     * - Only BIOMETRIC_STRONG is allowed (no DEVICE_CREDENTIAL fallback)
+     *   because CryptoObject binding requires a biometric-capable authenticator
+     */
+    private fun signWithBiometricHardGate(
+        alias: String,
+        data: ByteArray,
+        result: MethodChannel.Result
+    ) {
+        val ks = KeyStore.getInstance("AndroidKeyStore").also { it.load(null) }
+        val privateKey = ks.getKey(alias, null) as PrivateKey
+        val sig = Signature.getInstance("Ed25519")
+        sig.initSign(privateKey)
+
+        pendingHardGateResult = result
+        pendingHardGateData = data
+
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("PAM — Authorize Command")
+            .setSubtitle("Biometric required — TEE-level enforcement")
+            .setDescription("The signing key will not be released without biometric confirmation.")
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+            .setNegativeButtonText("Cancel")
+            .build()
+
+        val executor = ContextCompat.getMainExecutor(this)
+        val biometricPrompt = BiometricPrompt(
+            this,
+            executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(
+                    authResult: BiometricPrompt.AuthenticationResult
+                ) {
+                    val pResult = pendingHardGateResult ?: return
+                    val pData   = pendingHardGateData   ?: return
+                    pendingHardGateResult = null
+                    pendingHardGateData   = null
+                    try {
+                        val s = authResult.cryptoObject!!.signature!!
+                        s.update(pData)
+                        pResult.success(Base64.encodeToString(s.sign(), Base64.NO_WRAP))
+                    } catch (e: Exception) {
+                        pResult.error("SIGN_ERROR", e.message, null)
+                    }
+                }
+
+                override fun onAuthenticationFailed() {}
+
+                override fun onAuthenticationError(
+                    errorCode: Int,
+                    errString: CharSequence
+                ) {
+                    val pResult = pendingHardGateResult ?: return
+                    pendingHardGateResult = null
+                    pendingHardGateData   = null
+                    pResult.error(
+                        "BIOMETRIC_CANCELLED",
+                        errString.toString(),
+                        errorCode.toString()
+                    )
+                }
+            }
+        )
+
+        biometricPrompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(sig))
     }
 
     // ── Key management ───────────────────────────────────────────────────

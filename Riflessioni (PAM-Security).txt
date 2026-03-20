@@ -493,6 +493,261 @@ Il seguente insieme di limitazioni è accettato nel threat model corrente:
 Questi limiti sono documentati anche in PAM_Architecture.md, Sezione 12 (Residual Risks).
 
 ================================================================================
+7. ANALISI DI COMPATIBILITÀ — LE SOLUZIONI VIOLANO I PRINCIPI DI PAM?
+================================================================================
 
-Documento redatto in sessione di analisi tecnica pre-implementazione, 2026-03-20.
-Riferimento implementativo: commit 636b0e7, repository GioVan1098/Panel-Access-Manager.
+7.1 I sette principi fondamentali di PAM
+-----------------------------------------
+
+Prima di analizzare ogni soluzione, è utile elencare i principi che non devono essere violati:
+
+    P1 — Zero trust ad ogni layer: ogni layer è indipendentemente sicuro
+    P2 — Zero segreti condivisi sul server: il server non può forgiare comandi
+    P3 — Chiave client hardware-backed non esportabile
+    P4 — Completamente self-hosted, nessuna dipendenza SaaS runtime
+    P5 — Privilegio minimo: setcap, whitelist comandi, no sudo wildcard
+    P6 — Audit trail crittografico con integrità verificabile
+    P7 — Nessun segreto nel codice sorgente
+
+7.2 Analisi per ogni soluzione
+--------------------------------
+
+L-A — Full Keystore Attestation:
+
+Allineamento perfetto con P3. Rafforza la verifica hardware-backed.
+Unica considerazione: per verificare la catena di attestazione il server deve embeddare
+il Google Hardware Attestation Root CA (certificato pubblico, ~1KB). Questa è una
+dipendenza STATICA di verifica, non una chiamata runtime a Google. PAM rimane
+completamente self-hosted. Il modello è analogo a embeddare una root CA per verifica
+certificati: fatto una volta al setup, mai consultato online.
+Rischio residuo: se Google ruotasse le chiavi di attestazione hardware (non è mai
+successo nella storia del programma), il server richiederebbe aggiornamento. Accettabile.
+Nessun principio violato.
+
+L-B — allowBackup=false:
+
+Una riga in AndroidManifest. Zero nuovi meccanismi, zero complessità aggiuntiva.
+Chiude il vettore di attacco della TLS client key tramite backup non cifrato.
+Nessun principio violato. Puro rafforzamento di P3 esteso alla TLS key.
+
+L-C — Hard-gate CryptoObject:
+
+Rafforza P3 portando il blocco biometrico dal livello applicativo al TEE hardware.
+Il tradeoff operativo è che la biometrica diventa obbligatoria (scelta al provisioning),
+non più opzionale. Non viola nessun principio — anzi, rafforza P1 (layer biometrico
+diventa indipendente dalla correttezza dell'app, poiché il TEE non espone la chiave
+senza autenticazione hardware). L'utente che sceglie "Standard" mantiene il soft-gate.
+L'utente che sceglie "Hardened" ottiene protezione TEE-level contro Frida/hooking.
+
+L-D — WireGuard PSK:
+
+Aggiunta di un layer simmetrico sopra lo scambio Curve25519. Rafforza P1 (Layer 0 più
+robusto) e P4 (la quantum resistance è locale, nessuna dipendenza esterna).
+Nessun principio violato. Una riga di configurazione per peer.
+
+L-E — Wake-on-LAN:
+
+Non è un feature di sicurezza — è operativa/UX. Non rafforza né indebolisce il modello
+di sicurezza. L'unico dettaglio: il magic packet UDP è non cifrato. Per PAM direct (LAN
+trusted), questo è accettabile. Per PAM-hardened, il pacchetto viaggia attraverso il
+tunnel WireGuard (cifrato). Nessun principio violato.
+Limitazione architetturale: il WoL attraverso tunnel WireGuard verso un PC in sleep
+profondo non funziona perché il processo WireGuard sul PC non è attivo durante lo sleep.
+Funziona in modo affidabile solo per PC in stato di sospensione leggera
+(suspend-to-RAM) con WireGuard kernel module ancora carico. Documentato.
+
+L-F — Audit log asimmetrico:
+
+Rafforza direttamente P6. L'HMAC simmetrico con chiave in config.toml è vulnerabile
+dopo una compromissione del server: l'attaccante con accesso al filesystem ottiene la
+chiave HMAC e può modificare il log. La firma Ed25519 con chiave in memoria (separata
+da config.toml) richiede l'accesso al processo in esecuzione, non solo ai file su disco.
+Nessun principio violato. Puro rafforzamento del layer di audit.
+
+7.3 Tabella riepilogativa
+--------------------------
+
+    ┌──────────┬──────────────────────────────────────────────┬────────────┬────────────────┐
+    │    ID    │             Principio rafforzato             │ Regressioni│    Tradeoff    │
+    ├──────────┼──────────────────────────────────────────────┼────────────┼────────────────┤
+    │ L-A      │ P3 — attestazione hardware verificabile      │ Nessuna    │ Google Root CA │
+    │          │                                              │            │ statica embed. │
+    ├──────────┼──────────────────────────────────────────────┼────────────┼────────────────┤
+    │ L-B      │ P3 — TLS key non estraibile da backup        │ Nessuna    │ No Google      │
+    │          │                                              │            │ backup app     │
+    ├──────────┼──────────────────────────────────────────────┼────────────┼────────────────┤
+    │ L-C      │ P1, P3 — blocco biometrico TEE-level         │ Nessuna    │ Biometrica     │
+    │          │                                              │            │ obbligatoria   │
+    │          │                                              │            │ in modo harden.│
+    ├──────────┼──────────────────────────────────────────────┼────────────┼────────────────┤
+    │ L-D      │ P1, P4 — Layer 0 quantum-resistant           │ Nessuna    │ 1 riga config  │
+    ├──────────┼──────────────────────────────────────────────┼────────────┼────────────────┤
+    │ L-E      │ Nessuno (operativa)                          │ Nessuna    │ WoL limitato   │
+    │          │                                              │            │ su sleep prof. │
+    ├──────────┼──────────────────────────────────────────────┼────────────┼────────────────┤
+    │ L-F      │ P6 — audit non forgiabile post-compromise    │ Nessuna    │ Nessuno        │
+    └──────────┴──────────────────────────────────────────────┴────────────┴────────────────┘
+
+Nessuna delle sei soluzioni viola i principi fondamentali di PAM. Tutte sono additive.
+L'architettura di sicurezza rimane integra e coerente dopo l'applicazione di tutte e sei.
+
+
+================================================================================
+8. L-A: ANALISI DI IMPATTO — FULL KEYSTORE ATTESTATION
+================================================================================
+
+Questa sezione documenta in dettaglio quali file e quale logica cambierebbe se si
+implementasse la full attestation chain (L-A). L-A non è stata implementata in questa
+sessione — questo è un reference per un'implementazione futura.
+
+8.1 Il meccanismo
+-----------------
+
+Keystore Attestation con challenge nonce funziona così:
+
+1. Il server genera un nonce casuale (es. 32 byte, hex) e lo include nel QR di provisioning
+   (campo aggiuntivo `challenge`) oppure in una pre-provisioning call GET /challenge.
+
+2. Sul dispositivo Android, la chiave Ed25519 viene generata con:
+   ```kotlin
+   KeyGenParameterSpec.Builder(alias, PURPOSE_SIGN)
+       .setAttestationChallenge(challenge)  // ← nuovo
+       ...
+       .build()
+   ```
+   Il TEE/StrongBox firma la catena di certificati includendo il nonce — questo garantisce
+   che l'attestazione sia fresca (non un replay di una attestazione pre-esistente).
+
+3. Dopo generateKeyPair(), l'app recupera la catena:
+   ```kotlin
+   val chain = keyStore.getCertificateChain(alias)
+   // chain[0] = foglia (contiene l'estensione ASN.1 con i parametri di integrità)
+   // chain[1..n] = intermedi fino alla Google Device Attestation Root CA
+   ```
+
+4. La catena viene inviata al server nel payload di POST /provision.
+
+5. Il server:
+   a. Verifica la firma della catena verso la Google Device Attestation Root CA (embedded)
+   b. Verifica che il challenge nel certificato foglia corrisponda al nonce emesso
+   c. Legge l'estensione ASN.1 (OID 1.3.6.1.4.1.11129.2.1.17) — "Key Attestation Extension"
+   d. Estrae e valuta:
+      - verifiedBootState: VERIFIED | SELF_SIGNED | UNVERIFIED | FAILED
+      - bootloaderLocked: true | false
+      - securityLevel: STRONG_BOX | TRUSTED_ENVIRONMENT | SOFTWARE
+      - osVersion, patchLevel (per valutare aggiornamenti mancanti)
+   e. Decide se accettare o rifiutare il provisioning in base a una policy configurabile
+      (es. solo VERIFIED + bootloaderLocked=true, oppure warning per UNVERIFIED)
+
+8.2 File da modificare — Android/Dart
+---------------------------------------
+
+    MainActivity.kt:
+    Nuovo metodo `generateKeyPairWithAttestation(alias, challengeHex)` che:
+    - Converte challengeHex a ByteArray
+    - Chiama KeyGenParameterSpec.Builder con .setAttestationChallenge(challengeBytes)
+    - Dopo generateKeyPair(), chiama keyStore.getCertificateChain(alias)
+    - Serializza ogni certificato in Base64 PEM e li restituisce come List<String>
+
+    keystore_service.dart:
+    Nuovo metodo `generateKeyPairWithAttestation(alias, challengeHex)` che:
+    - Chiama il MethodChannel 'generateKeyPairWithAttestation'
+    - Riceve List<String> (catena PEM) + pubkey separata (o estratta dal primo cert)
+    - Restituisce un oggetto strutturato {pubKey, certChain}
+
+    provisioning_screen.dart:
+    Modifica a _handleQr():
+    - Legge il campo `challenge` dal QR (se presente)
+    - Se challenge presente: usa generateKeyPairWithAttestation
+    - Invia la catena nel body di POST /provision: { otp, ed25519_pubkey, cert_chain: [...] }
+    - Gestisce la risposta con eventuale `attestation_warning` dal server
+
+    http_service.dart:
+    Modifica a provision():
+    - Aggiunge campo opzionale `cert_chain` nel body della richiesta
+    - Gestisce risposta con `attestation_status` (VERIFIED | UNVERIFIED | SOFTWARE | ...)
+
+8.3 File da modificare — Server/Setup
+---------------------------------------
+
+    bridge_v2.py:
+    Modifica a _h_provision():
+    - Se `cert_chain` presente nel body: chiama verify_attestation_chain(cert_chain, challenge)
+    - verify_attestation_chain():
+      1. Carica i certificati dalla lista PEM
+      2. Verifica la firma di ogni certificato verso il successivo nella catena
+      3. Verifica la catena verso il Google Hardware Attestation Root CA (embedded)
+      4. Verifica che il challenge nel cert[0] corrisponda al nonce emesso
+      5. Estrae i parametri dall'estensione ASN.1 (OID 1.3.6.1.4.1.11129.2.1.17)
+         Librerie: `asn1crypto` o `cryptography` con parsing manuale
+      6. Ritorna un dict con {verified_boot_state, bootloader_locked, security_level, ...}
+    - Policy configurabile in config.toml (es. reject_if_unverified = false)
+    - Aggiunge attestation_status alla risposta di /provision
+    - Logga i dati di attestazione nell'audit log
+
+    Nuovo file: assets/google_device_attestation_root.pem
+    - Google Hardware Attestation Root CA embedded nel repository server
+    - Usato da verify_attestation_chain() per la validazione della catena
+    - Non cambia mai (root CA hardware Google — identica per tutti i dispositivi)
+
+    setup.sh:
+    - Aggiunge generazione nonce challenge (alternativa: incluso nel QR generato da qr.c)
+
+    gui/qr.c e gui/qr.h:
+    - Aggiunge campo `challenge` nel payload QR:
+      { "addr": "ip:port", "otp": "hex128", "fp": "sha256hex", "challenge": "hex64" }
+    - Challenge generato casualmente a ogni QR display (usato una sola volta)
+
+8.4 Dipendenze aggiuntive
+--------------------------
+
+    Server (Python):
+    - `asn1crypto` (pip install asn1crypto) per il parsing dell'estensione OID proprietaria
+    - Oppure implementazione manuale con `cryptography` (già presente) per il parsing DER
+
+    Client (Dart/Kotlin):
+    - Nessuna libreria aggiuntiva: `KeyStore.getCertificateChain()` è API Android standard
+
+8.5 Modifica al QR payload format (BREAKING CHANGE)
+-----------------------------------------------------
+
+Il QR payload cambierebbe da:
+    {"addr":"ip:port","otp":"hex128","fp":"sha256hex"}
+a:
+    {"addr":"ip:port","otp":"hex128","fp":"sha256hex","challenge":"hex64"}
+
+Questa è una breaking change: app più vecchie senza supporto attestation non leggerebbero
+il campo `challenge`. Per retrocompatibilità: il campo challenge è opzionale lato app.
+Se il server genera QR senza challenge, il provisioning avviene senza attestation (come ora).
+Se il server genera QR con challenge, l'app con supporto attestation lo usa; app più vecchie
+lo ignorano (provisioning senza attestation, accettato dal server con eventuale warning).
+
+8.6 Sommario impatto
+---------------------
+
+    File modificati:
+    - MainActivity.kt                 (+30 righe circa)
+    - keystore_service.dart           (+15 righe circa)
+    - provisioning_screen.dart        (+20 righe circa)
+    - http_service.dart               (+10 righe circa)
+    - bridge_v2.py                    (+80 righe circa)
+    - gui/qr.c                        (+5 righe circa)
+
+    File nuovi:
+    - assets/google_device_attestation_root.pem   (certificato statico)
+
+    Dipendenze nuove:
+    - asn1crypto (Python, server only)
+
+    Breaking change:
+    - QR payload format (retrocompatibile con campo opzionale)
+
+    Effort stimato: ~160 righe di codice nuovo, test approfondito necessario
+    perché la verifica ASN.1 dell'estensione OID è delicata.
+
+================================================================================
+
+Documento aggiornato in sessione di revisione e implementazione, 2026-03-20.
+Riferimento implementativo: commit 8012b0b, repository GioVan1098/Panel-Access-Manager.
+L-B, L-C, L-D, L-E, L-F implementate in questa sessione.
+L-A documentata come estensione futura (vedere sezione 8).

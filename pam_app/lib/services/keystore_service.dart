@@ -12,6 +12,18 @@ class KeystoreService {
     return pubKey!;
   }
 
+  /// Generate a key pair with TEE-level biometric authentication required.
+  /// The key cannot be used without a biometric event bound via CryptoObject.
+  /// [setUserAuthenticationRequired] + [setUserAuthenticationValidityDurationSeconds(-1)]
+  /// + [setInvalidatedByBiometricEnrollment] are set at generation time.
+  Future<String> generateKeyPairHardened(String alias) async {
+    final pubKey = await _channel.invokeMethod<String>(
+      'generateKeyPairHardened',
+      {'alias': alias},
+    );
+    return pubKey!;
+  }
+
   Future<String> sign(String alias, Uint8List data) async {
     final sig = await _channel.invokeMethod<String>(
       'sign',
@@ -40,6 +52,18 @@ class KeystoreService {
   Future<String> signWithBiometric(String alias, Uint8List data) async {
     final sig = await _channel.invokeMethod<String>(
       'signWithBiometric',
+      {'alias': alias, 'data': data},
+    );
+    return sig!;
+  }
+
+  /// Sign using the hard-gate biometric path.
+  /// Requires a key generated with [generateKeyPairHardened].
+  /// The Signature object is bound to a CryptoObject — the TEE refuses
+  /// to complete signing without a BIOMETRIC_STRONG authentication event.
+  Future<String> signWithBiometricHardGate(String alias, Uint8List data) async {
+    final sig = await _channel.invokeMethod<String>(
+      'signWithBiometricHardGate',
       {'alias': alias, 'data': data},
     );
     return sig!;

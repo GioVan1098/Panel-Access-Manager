@@ -3,8 +3,8 @@
 #
 # Run this script on the VPS (Oracle Free Tier / Hetzner / any Linux VPS).
 # It configures WireGuard, NAT forwarding, and UFW rules.
-# After this script completes, take note of the VPS public key and
-# pass it to setup.sh --hardened on your PC.
+# After this script completes, take note of the VPS public key AND the
+# PC pre-shared key, and pass both to setup.sh --hardened on your PC.
 set -euo pipefail
 
 # ── Colors ────────────────────────────────────────────────────────────────
@@ -65,6 +65,17 @@ if [[ "${GEN_ANDROID,,}" != "n" ]]; then
     ok "Android keypair generated"
 fi
 
+# ── Pre-shared keys (L-D — quantum resistance, per-peer) ──────────────────
+# Each PSK is a unique 32-byte symmetric key placed in the [Peer] block
+# on BOTH sides of the peering. It adds a layer of symmetric encryption
+# on top of the Curve25519 key exchange (Noise_IKpsk2 handshake),
+# providing resistance against future quantum attacks on the ECDH step.
+# The VPS and PC must have the SAME PC_PSK; VPS and Android the SAME ANDROID_PSK.
+info "Generating WireGuard pre-shared keys..."
+PC_PSK=$(wg genpsk)
+ANDROID_PSK=$(wg genpsk)
+ok "Pre-shared keys generated"
+
 # ── Build wg0.conf ────────────────────────────────────────────────────────
 info "Writing /etc/wireguard/wg0.conf..."
 sudo tee /etc/wireguard/wg0.conf > /dev/null <<WG
@@ -77,8 +88,9 @@ PostDown   = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j
 
 [Peer]
 # PC (PAM daemon — binds to 10.0.0.2:7443)
-PublicKey  = ${PC_PUB}
-AllowedIPs = 10.0.0.2/32
+PublicKey    = ${PC_PUB}
+PresharedKey = ${PC_PSK}
+AllowedIPs   = 10.0.0.2/32
 WG
 
 if [ -n "$ANDROID_PUB" ]; then
@@ -86,8 +98,9 @@ if [ -n "$ANDROID_PUB" ]; then
 
 [Peer]
 # Android client
-PublicKey  = ${ANDROID_PUB}
-AllowedIPs = 10.0.0.3/32
+PublicKey    = ${ANDROID_PUB}
+PresharedKey = ${ANDROID_PSK}
+AllowedIPs   = 10.0.0.3/32
 WG
 fi
 
@@ -136,6 +149,21 @@ info "  PC daemon:     10.0.0.2  (setup.sh --hardened)"
 info "  Android:       10.0.0.3  (WireGuard client)"
 echo ""
 
+echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}  IMPORTANT — Pre-shared keys (save these securely)${NC}"
+echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "  ${BOLD}PC_PSK (needed for setup.sh --hardened on the PC):${NC}"
+echo -e "  ${BLUE}${PC_PSK}${NC}"
+echo ""
+if [ -n "$ANDROID_PUB" ]; then
+    echo -e "  ${BOLD}ANDROID_PSK (for Android WireGuard config below):${NC}"
+    echo -e "  ${BLUE}${ANDROID_PSK}${NC}"
+    echo ""
+fi
+warn "These keys cannot be retrieved after this script exits."
+echo ""
+
 if [ -n "$ANDROID_PRIV" ]; then
     echo -e "${BOLD}Android WireGuard client config (import into WireGuard app):${NC}"
     echo ""
@@ -147,6 +175,7 @@ DNS        = 1.1.1.1
 
 [Peer]
 PublicKey           = ${VPS_PUB}
+PresharedKey        = ${ANDROID_PSK}
 Endpoint            = ${VPS_IP}:51820
 AllowedIPs          = 10.0.0.0/24
 PersistentKeepalive = 25
@@ -156,5 +185,5 @@ ANDROID
 fi
 
 info "Next: run setup.sh --hardened on the PC."
-info "PC public key was already provided; VPS public key: ${VPS_PUB}"
+info "You will need: VPS public key (${VPS_PUB}) and PC_PSK (shown above)."
 echo ""

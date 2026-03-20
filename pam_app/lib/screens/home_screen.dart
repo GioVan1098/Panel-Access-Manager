@@ -74,13 +74,43 @@ class _HomeScreenState extends State<HomeScreen> {
       final tlsCert = Uint8List.fromList(utf8.encode(tlsCertPem));
       final tlsKey = Uint8List.fromList(utf8.encode(tlsKeyPem));
 
+      // Wake-on-LAN: send magic packet before the command if enabled.
+      // Gives the PC a brief window to wake from light sleep.
+      final wolEnabled = await _storage.getWolEnabled();
+      if (wolEnabled) {
+        final wolMac = await _storage.getWolMacAddress();
+        if (wolMac != null && wolMac.isNotEmpty) {
+          final targetIp = _config.mode == PamMode.hardened
+              ? '10.0.0.2'          // unicast through WireGuard tunnel
+              : '255.255.255.255';  // LAN broadcast
+          try {
+            await HttpService.sendWolPacket(targetIp, wolMac);
+            // Brief delay: give PC time to begin waking before the command arrives
+            await Future.delayed(const Duration(seconds: 3));
+          } catch (_) {
+            // WoL delivery failure is non-blocking — attempt the command anyway
+          }
+        }
+      }
+
       final ts = _crypto.currentTimestamp();
       final nonce = _crypto.generateNonce();
       final payload = _crypto.buildCanonicalPayload(cmd.wireValue, ts, nonce);
-      final biometricEnabled = await _storage.getBiometricAuthEnabled();
-      final sig = biometricEnabled
-          ? await _crypto.signPayloadWithBiometric(_config.deviceId, payload)
-          : await _crypto.signPayload(_config.deviceId, payload);
+
+      // Security mode routing:
+      //   hardened  → hard-gate CryptoObject (TEE-enforced, mandatory biometric)
+      //   standard  → soft-gate if biometric enabled, direct sign otherwise
+      final securityMode = await _storage.getSecurityMode() ?? 'standard';
+      final String sig;
+      if (securityMode == 'hardened') {
+        sig = await _crypto.signPayloadWithBiometricHardGate(
+            _config.deviceId, payload);
+      } else {
+        final biometricEnabled = await _storage.getBiometricAuthEnabled();
+        sig = biometricEnabled
+            ? await _crypto.signPayloadWithBiometric(_config.deviceId, payload)
+            : await _crypto.signPayload(_config.deviceId, payload);
+      }
 
       final body = _crypto.buildCommandBody(
         command: cmd.wireValue,

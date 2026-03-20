@@ -22,6 +22,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _biometricEnabled = false;
   bool _biometricAvailable = false;
   String _biometricStatus = 'UNKNOWN';
+  String _securityMode = 'standard';
+  bool _wolEnabled = false;
+  final _wolMacController = TextEditingController();
 
   @override
   void initState() {
@@ -36,6 +39,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final provisioned = await _storage.isProvisioned();
     final deviceId = await _storage.getDeviceId();
     final biometricEnabled = await _storage.getBiometricAuthEnabled();
+    final securityMode = await _storage.getSecurityMode() ?? 'standard';
+    final wolEnabled = await _storage.getWolEnabled();
+    final wolMac = await _storage.getWolMacAddress();
     Map<String, dynamic> availability = {};
     try {
       availability = await _keystore.getBiometricAvailability();
@@ -51,6 +57,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           availability['any_auth_available'] as bool? ?? false;
       _biometricStatus =
           availability['biometric_status'] as String? ?? 'UNKNOWN';
+      _securityMode = securityMode;
+      _wolEnabled = wolEnabled;
+      _wolMacController.text = wolMac ?? '';
     });
   }
 
@@ -102,6 +111,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
     if (confirm == true) {
+      // Delete Keystore key BEFORE clearAll: device_id is needed to find the
+      // key alias, and clearAll would wipe it first (pre-existing bug fix).
+      if (_deviceId.isNotEmpty) {
+        try {
+          await _keystore.deleteKey(_deviceId);
+        } catch (_) {}
+      }
       await _storage.clearAll();
       setState(() {
         _provisioned = false;
@@ -176,6 +192,62 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 : null,
           ),
           const Divider(),
+          // Security mode (read-only — set during provisioning)
+          ListTile(
+            leading: Icon(
+              _securityMode == 'hardened' ? Icons.lock : Icons.lock_open,
+              color: _securityMode == 'hardened' ? Colors.indigo : Colors.grey,
+            ),
+            title: const Text('Security mode'),
+            subtitle: Text(
+              _securityMode == 'hardened'
+                  ? 'Hardened — TEE-level biometric enforcement per command. '
+                      'To change, deprovision and re-provision.'
+                  : 'Standard — optional biometric gate (toggle above).',
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+          const Divider(),
+          // Wake-on-LAN
+          SwitchListTile(
+            secondary: const Icon(Icons.power_settings_new),
+            title: const Text('Wake-on-LAN before commands'),
+            subtitle: const Text(
+              'Send a WoL magic packet to wake the PC from light sleep '
+              'before sending a command.',
+            ),
+            value: _wolEnabled,
+            onChanged: (v) async {
+              await _storage.setWolEnabled(v);
+              setState(() => _wolEnabled = v);
+            },
+          ),
+          if (_wolEnabled) ...[
+            const SizedBox(height: 8),
+            TextField(
+              controller: _wolMacController,
+              decoration: const InputDecoration(
+                labelText: 'PC MAC address',
+                hintText: 'aa:bb:cc:dd:ee:ff',
+                helperText:
+                    'Found in setup.sh output or BIOS/UEFI network settings.',
+              ),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              onPressed: () async {
+                await _storage.setWolMacAddress(_wolMacController.text.trim());
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('MAC address saved')),
+                  );
+                }
+              },
+              child: const Text('Save MAC address'),
+            ),
+            const SizedBox(height: 4),
+          ],
+          const Divider(),
           ListTile(
             leading: Icon(
               _provisioned ? Icons.verified_user : Icons.no_accounts,
@@ -221,6 +293,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void dispose() {
     _ipController.dispose();
     _portController.dispose();
+    _wolMacController.dispose();
     super.dispose();
   }
 }

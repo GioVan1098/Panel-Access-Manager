@@ -87,11 +87,66 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
         await _storage.setDeviceId(deviceId);
       }
 
-      // Generate Ed25519 keypair in hardware Keystore (idempotent)
+      // ── Security mode selection (first provisioning only) ──────────────
+      // 'standard': soft-gate biometric (optional, changeable in Settings)
+      // 'hardened': hard-gate CryptoObject (mandatory, TEE-enforced per-command)
+      // Mode is chosen once and baked into the Keystore key at generation time.
+      // Changing mode later requires re-provisioning (key must be regenerated).
+      String? existingMode = await _storage.getSecurityMode();
+      String securityMode = existingMode ?? 'standard';
+
+      if (existingMode == null && mounted) {
+        final chosen = await showDialog<String>(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => AlertDialog(
+            title: const Text('Security Mode'),
+            content: const Text(
+              'Choose how commands are authenticated:\n\n'
+              'Standard — biometric confirmation is optional and can be '
+              'toggled in Settings without re-provisioning.\n\n'
+              'Hardened — every command requires a biometric event enforced '
+              'at the Trusted Execution Environment (TEE) level. '
+              'Cannot be bypassed in software. Changing mode requires '
+              're-provisioning the device.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, 'standard'),
+                child: const Text('Standard'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, 'hardened'),
+                child: const Text('Hardened'),
+              ),
+            ],
+          ),
+        );
+        securityMode = chosen ?? 'standard';
+        await _storage.setSecurityMode(securityMode);
+      }
+
+      // ── Key generation (mode-aware) ────────────────────────────────────
       final bool keyExists = await _keystore.hasKey(deviceId);
-      final String ed25519PubKey = keyExists
-          ? await _keystore.getPublicKey(deviceId)
-          : await _keystore.generateKeyPair(deviceId);
+      final String ed25519PubKey;
+
+      if (keyExists) {
+        // If the security mode changed (re-provisioning with different mode),
+        // delete the old key so the new one is generated with the correct flags.
+        if (existingMode != null && existingMode != securityMode) {
+          await _keystore.deleteKey(deviceId);
+          await _storage.setSecurityMode(securityMode);
+          ed25519PubKey = securityMode == 'hardened'
+              ? await _keystore.generateKeyPairHardened(deviceId)
+              : await _keystore.generateKeyPair(deviceId);
+        } else {
+          ed25519PubKey = await _keystore.getPublicKey(deviceId);
+        }
+      } else {
+        ed25519PubKey = securityMode == 'hardened'
+            ? await _keystore.generateKeyPairHardened(deviceId)
+            : await _keystore.generateKeyPair(deviceId);
+      }
 
       final result = await _http.provision(
         serverIp: serverIp,

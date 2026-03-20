@@ -11,7 +11,6 @@ Start: python3 bridge_v2.py
 
 import base64
 import hashlib
-import hmac as hmac_mod
 import http.server
 import json
 import logging
@@ -35,15 +34,18 @@ except ImportError:
     except ImportError:
         tomllib = None
 
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
 # ── Paths ──────────────────────────────────────────────────────────────
 HOME         = os.path.expanduser("~")
 CONFIG_DIR   = os.path.join(HOME, ".config", "rofi-bridge")
 CONFIG_FILE  = os.path.join(CONFIG_DIR, "config.toml")
-NONCE_DB     = os.path.join(CONFIG_DIR, "nonces.db")
-AUDIT_LOG    = os.path.join(CONFIG_DIR, "audit.log")
+NONCE_DB       = os.path.join(CONFIG_DIR, "nonces.db")
+AUDIT_LOG      = os.path.join(CONFIG_DIR, "audit.log")
+AUDIT_SIGN_KEY = os.path.join(CONFIG_DIR, "audit_sign.key")
 PENDING_OTPS = os.path.join(CONFIG_DIR, "pending_otps.json")
 SERVER_KEY   = os.path.join(CONFIG_DIR, "server.key")
 SERVER_CRT   = os.path.join(CONFIG_DIR, "server.crt")
@@ -94,7 +96,6 @@ def load_config() -> dict:
         "mode":       "direct",  # "direct" | "hardened"
         "untrusted":  False,
         "mdns":       True,
-        "audit_key":  "",        # hex-encoded HMAC key; generated once by setup.sh
     }
     if not os.path.exists(CONFIG_FILE):
         return defaults
@@ -152,9 +153,15 @@ def check_and_store_nonce(nonce: str, ts: float) -> bool:
             return False  # duplicate → replay
 
 
-# ── Audit log (append-only, HMAC per line) ────────────────────────────
-_audit_lock = threading.Lock()
-_audit_key  = b""   # loaded from config
+# ── Audit log (append-only, Ed25519 signature per line) ───────────────
+# Each log line: <json_entry>|<base64_ed25519_sig>
+# The private key (audit_sign.key) is required to write entries.
+# The public key (audit_sign.pub) is sufficient to verify them.
+# If the signing key file is missing at startup, an ephemeral key is
+# generated in memory (audit entries are valid but not verifiable across
+# restarts until setup.sh is run to generate a persistent keypair).
+_audit_lock     = threading.Lock()
+_audit_sign_key: Optional[Ed25519PrivateKey] = None
 
 
 def audit(device_id: str, command: str, result: str, cert_serial: str = "") -> None:
@@ -165,8 +172,11 @@ def audit(device_id: str, command: str, result: str, cert_serial: str = "") -> N
         "result":      result,
         "cert_serial": cert_serial,
     }, separators=(",", ":"))
-    mac  = hmac_mod.new(_audit_key, entry.encode(), hashlib.sha256).hexdigest()
-    line = f"{entry}|{mac}\n"
+    if _audit_sign_key is not None:
+        sig = base64.b64encode(_audit_sign_key.sign(entry.encode())).decode()
+    else:
+        sig = "no_key"
+    line = f"{entry}|{sig}\n"
     with _audit_lock:
         with open(AUDIT_LOG, "a") as f:
             f.write(line)
@@ -612,7 +622,7 @@ def start_mdns(port: int):
 
 # ── Entry point ────────────────────────────────────────────────────────
 def main() -> None:
-    global _audit_key
+    global _audit_sign_key
 
     logging.basicConfig(
         level=logging.INFO,
@@ -644,13 +654,25 @@ def main() -> None:
             finally:
                 s.close()
 
-    # Audit HMAC key
-    key_hex = str(config.get("audit_key", "")).strip()
-    if key_hex:
-        _audit_key = bytes.fromhex(key_hex)
+    # Audit signing key (L-F — Ed25519, asymmetric)
+    if os.path.exists(AUDIT_SIGN_KEY):
+        try:
+            with open(AUDIT_SIGN_KEY, "rb") as f:
+                _audit_sign_key = serialization.load_pem_private_key(
+                    f.read(), password=None
+                )
+            logging.info("Audit signing key loaded from %s", AUDIT_SIGN_KEY)
+        except Exception as e:
+            logging.warning(
+                "Failed to load audit signing key: %s — generating ephemeral key", e
+            )
+            _audit_sign_key = Ed25519PrivateKey.generate()
     else:
-        _audit_key = os.urandom(32)
-        logging.warning("audit_key missing — HMAC not persistent across restarts")
+        _audit_sign_key = Ed25519PrivateKey.generate()
+        logging.warning(
+            "audit_sign.key not found at %s — using ephemeral key "
+            "(run setup.sh to generate a persistent keypair)", AUDIT_SIGN_KEY
+        )
 
     init_nonce_db()
     threading.Thread(target=_nonce_cleanup_loop, daemon=True).start()

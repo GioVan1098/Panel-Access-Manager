@@ -5,6 +5,17 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import '../models/config.dart';
 
+// ── Wake-on-LAN ──────────────────────────────────────────────────────────
+// Magic packet: 6 × 0xFF followed by the target MAC repeated 16 times (102 bytes).
+// Sent as a UDP datagram to port 9.
+//
+// PAM (direct mode): targetIp = '255.255.255.255' (LAN broadcast)
+// PAM-hardened:      targetIp = '10.0.0.2' (unicast via WireGuard tunnel)
+//   Limitation: works only in light sleep where the WireGuard kernel module
+//   is still loaded. Deep sleep (WireGuard process down) prevents IP-layer
+//   delivery to the physical NIC.
+
+
 class ProvisioningResult {
   final String caCertPem;
   final String tlsCertPem;
@@ -141,6 +152,32 @@ class HttpService {
         return tryEndpoint(config.fallbackEndpoint);
       }
       rethrow;
+    }
+  }
+
+  static Future<void> sendWolPacket(String targetIp, String macAddress) async {
+    final parts = macAddress.split(RegExp(r'[:\-]'));
+    if (parts.length != 6) {
+      throw ArgumentError('Invalid MAC address format: $macAddress');
+    }
+    final mac = parts.map((s) => int.parse(s, radix: 16)).toList();
+    final packet = Uint8List(102);
+    // First 6 bytes: synchronization stream (0xFF × 6)
+    for (int i = 0; i < 6; i++) {
+      packet[i] = 0xFF;
+    }
+    // Remaining 96 bytes: MAC address repeated 16 times
+    for (int rep = 0; rep < 16; rep++) {
+      for (int b = 0; b < 6; b++) {
+        packet[6 + rep * 6 + b] = mac[b];
+      }
+    }
+    final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    try {
+      socket.broadcastEnabled = true;
+      socket.send(packet, InternetAddress(targetIp), 9);
+    } finally {
+      socket.close();
     }
   }
 

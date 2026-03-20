@@ -14,6 +14,9 @@ class StorageService {
   static const _keyTlsKey = 'tls_key';
   static const _keyProvisioned = 'provisioned';
   static const _keyBiometricAuth = 'biometric_auth';
+  static const _keySecurityMode  = 'security_mode';  // 'standard' | 'hardened'
+  static const _keyWolEnabled    = 'wol_enabled';
+  static const _keyWolMac        = 'wol_mac';
 
   Future<String?> getDeviceId() => _storage.read(key: _keyDeviceId);
   Future<void> setDeviceId(String v) => _storage.write(key: _keyDeviceId, value: v);
@@ -48,6 +51,23 @@ class StorageService {
       await _storage.read(key: _keyBiometricAuth) == 'true';
   Future<void> setBiometricAuthEnabled(bool v) =>
       _storage.write(key: _keyBiometricAuth, value: v.toString());
+
+  // Security mode: 'standard' (soft-gate) or 'hardened' (hard-gate CryptoObject).
+  // Null means not yet chosen (first provisioning).
+  // Changing from 'standard' to 'hardened' requires re-provisioning (key regeneration).
+  Future<String?> getSecurityMode() => _storage.read(key: _keySecurityMode);
+  Future<void> setSecurityMode(String v) =>
+      _storage.write(key: _keySecurityMode, value: v);
+
+  // Wake-on-LAN
+  Future<bool> getWolEnabled() async =>
+      await _storage.read(key: _keyWolEnabled) == 'true';
+  Future<void> setWolEnabled(bool v) =>
+      _storage.write(key: _keyWolEnabled, value: v.toString());
+
+  Future<String?> getWolMacAddress() => _storage.read(key: _keyWolMac);
+  Future<void> setWolMacAddress(String v) =>
+      _storage.write(key: _keyWolMac, value: v);
 
   Future<void> clearAll() => _storage.deleteAll();
 }

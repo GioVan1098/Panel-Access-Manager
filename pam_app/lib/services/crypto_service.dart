@@ -28,6 +28,13 @@ class CryptoService {
     return _keystore.signWithBiometric(alias, bytes);
   }
 
+  /// Sign using TEE-level biometric hard-gate (CryptoObject-bound).
+  /// The key must have been generated with [KeystoreService.generateKeyPairHardened].
+  Future<String> signPayloadWithBiometricHardGate(String alias, String payload) {
+    final bytes = Uint8List.fromList(utf8.encode(payload));
+    return _keystore.signWithBiometricHardGate(alias, bytes);
+  }
+
   Map<String, dynamic> buildCommandBody({
     required String command,
     required String deviceId,

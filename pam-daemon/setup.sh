@@ -27,6 +27,7 @@ UNTRUSTED=0
 REGEN_CERT=0
 REGEN_ALL=0
 UNINSTALL=0
+WOL=0
 
 # ── Argument parsing ──────────────────────────────────────────────────────
 for arg in "$@"; do
@@ -36,6 +37,7 @@ for arg in "$@"; do
         --regenerate-server-cert) REGEN_CERT=1 ;;
         --regenerate-all)         REGEN_ALL=1  ;;
         --uninstall)              UNINSTALL=1  ;;
+        --wol)                    WOL=1        ;;
         --port=*)                 PORT="${arg#*=}" ;;
         *) die "Unknown argument: $arg" ;;
     esac
@@ -136,6 +138,7 @@ port           = ${PORT}
 mode           = "${MODE}"
 bind_ip        = "${BIND_IP}"
 untrusted_mode = $([ "$UNTRUSTED" -eq 1 ] && echo "true" || echo "false")
+wol_enabled    = $([ "$WOL" -eq 1 ] && echo "true" || echo "false")
 TOML
     chmod 600 "${CONFIG_DIR}/config.toml"
     ok "config.toml written"
@@ -254,6 +257,24 @@ getcap "${IPT_BIN}" | grep -q cap_net_admin \
     || die "setcap verification failed for ${IPT_BIN}"
 ok "ipt-helper installed with cap_net_admin: ${IPT_BIN}"
 
+# ── Audit log signing key (L-F — asymmetric Ed25519 audit) ───────────────
+# Replaces HMAC-SHA256 (shared secret in config.toml) with an Ed25519
+# private key loaded into daemon memory. Log entries are signed with the
+# private key; the public key is used for independent verification.
+# Even if config.toml is compromised, the signing key is in a separate file.
+if [ ! -f "${CONFIG_DIR}/audit_sign.key" ] || [ "$REGEN_ALL" -eq 1 ]; then
+    info "Generating audit log signing key (Ed25519)..."
+    openssl genpkey -algorithm ed25519 -out "${CONFIG_DIR}/audit_sign.key" 2>/dev/null
+    chmod 400 "${CONFIG_DIR}/audit_sign.key"
+    openssl pkey -in "${CONFIG_DIR}/audit_sign.key" -pubout \
+        -out "${CONFIG_DIR}/audit_sign.pub" 2>/dev/null
+    chmod 444 "${CONFIG_DIR}/audit_sign.pub"
+    ok "Audit signing key:  ${CONFIG_DIR}/audit_sign.key  (private — 400)"
+    ok "Audit verify key:   ${CONFIG_DIR}/audit_sign.pub  (public — 444)"
+else
+    ok "Audit signing key already exists (use --regenerate-all to replace)"
+fi
+
 # ── pam-setcap.service — system oneshot (C2 fix) ─────────────────────────
 info "Creating pam-setcap.service (system service)..."
 sudo tee /etc/systemd/system/pam-setcap.service > /dev/null <<SVC
@@ -297,6 +318,34 @@ SVC
 systemctl --user daemon-reload
 ok "rofi-bridge.service created (not yet enabled)"
 
+# ── Wake-on-LAN setup (--wol flag) ───────────────────────────────────────
+if [ "$WOL" -eq 1 ]; then
+    info "Wake-on-LAN: detecting PC MAC address..."
+    DEFAULT_IF=$(ip route show default 2>/dev/null | awk 'NR==1{print $5}')
+    LAN_MAC=""
+    if [ -n "$DEFAULT_IF" ]; then
+        LAN_MAC=$(ip link show "${DEFAULT_IF}" 2>/dev/null \
+            | awk '/link\/ether/{print $2}' | head -1)
+    fi
+    if [ -n "$LAN_MAC" ]; then
+        ok "PC MAC address: ${LAN_MAC}"
+        echo "wol_mac = \"${LAN_MAC}\"" >> "${CONFIG_DIR}/config.toml"
+    else
+        warn "Could not detect MAC address automatically."
+        warn "Enter it manually in the PAM app Settings → Wake-on-LAN."
+    fi
+    echo ""
+    warn "Wake-on-LAN requires the feature to be enabled in BIOS/UEFI:"
+    warn "  BIOS → Power Management → Wake-on-LAN → Enabled"
+    if [ "$HARDENED" -eq 0 ]; then
+        info "PAM (direct): WoL magic packet sent as broadcast 255.255.255.255:9."
+    else
+        info "PAM-hardened: WoL magic packet sent unicast to 10.0.0.2:9 via WireGuard."
+        warn "  Limitation: works in light sleep only (WireGuard kernel module loaded)."
+        warn "  Deep sleep (WG process down) prevents IP-layer delivery to the NIC."
+    fi
+fi
+
 # ── Hardened mode: WireGuard setup (PC side) ─────────────────────────────
 if [ "$HARDENED" -eq 1 ]; then
     echo ""
@@ -310,8 +359,10 @@ if [ "$HARDENED" -eq 1 ]; then
     echo -e "${BOLD}PC WireGuard public key (add this to VPS wg0.conf as a Peer):${NC}"
     echo -e "${BLUE}${PC_PUB}${NC}"
     echo ""
-    read -rp "  VPS WireGuard public key: " VPS_PUB
-    read -rp "  VPS endpoint (IP:port):  " VPS_ENDPOINT
+    read -rp "  VPS WireGuard public key:               " VPS_PUB
+    read -rp "  VPS endpoint (IP:port):                 " VPS_ENDPOINT
+    read -rp "  PC_PSK from relay-setup.sh output:      " PC_PSK
+    [ -n "$PC_PSK" ] || die "PC_PSK is required (generate with relay-setup.sh first)."
 
     sudo tee /etc/wireguard/wg0.conf > /dev/null <<WG
 [Interface]
@@ -319,9 +370,10 @@ PrivateKey = ${PC_PRIV}
 Address    = 10.0.0.2/24
 
 [Peer]
-PublicKey          = ${VPS_PUB}
-Endpoint           = ${VPS_ENDPOINT}
-AllowedIPs         = 10.0.0.0/24
+PublicKey           = ${VPS_PUB}
+PresharedKey        = ${PC_PSK}
+Endpoint            = ${VPS_ENDPOINT}
+AllowedIPs          = 10.0.0.0/24
 PersistentKeepalive = 25
 WG
     sudo chmod 600 /etc/wireguard/wg0.conf
@@ -337,6 +389,7 @@ echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 info "  Config:  ${CONFIG_DIR}/"
 info "  CA:      ${CA_DIR}/ca.key.enc"
+info "  Audit:   ${CONFIG_DIR}/audit_sign.key (private) + audit_sign.pub (public)"
 info "  Mode:    ${MODE}, port ${PORT}, bind ${BIND_IP}"
 echo ""
 info "  Start daemon:  systemctl --user start rofi-bridge"
