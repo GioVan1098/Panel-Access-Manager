@@ -27,6 +27,18 @@ Same daemon, same GUI, same app — only the transport layer differs.
 
 *PAM-hardened adds Layer 0: WireGuard — ChaCha20-Poly1305, Noise\_IKpsk2 protocol.*
 
+## Android client security
+
+The Android app implements three additional hardening measures independent of the network security layers:
+
+| Feature | Mechanism | Effect |
+|---|---|---|
+| **Screen protection** | `FLAG_SECURE` (WindowManager) | Blocks screenshots, screen recording, screen sharing at the SurfaceFlinger compositor level — identical to the mechanism used by banking and streaming apps |
+| **Biometric gate** | `BiometricPrompt` (BIOMETRIC\_STRONG \| DEVICE\_CREDENTIAL) | Optional per-command authentication confirmation; configurable in Settings; degrades gracefully based on device capability |
+| **Device integrity check** | Android Keystore `KeyInfo.securityLevel` + `Build.TAGS` | Detects absence of TEE / StrongBox and test-keys builds at provisioning time; warning dialog with user choice (non-blocking) |
+
+The biometric gate uses a soft-gate approach (no `CryptoObject` binding), which means it can be enabled or disabled at any time without re-provisioning the device. The device integrity check does not use Google Play Integrity API — it operates entirely offline via the hardware Keystore.
+
 ---
 
 ## Repository structure
@@ -50,7 +62,8 @@ pam_app/                 Flutter Android app
     services/            mTLS HTTP, Ed25519 Keystore, crypto, storage
     models/              PamCommand enum, PamConfig
   android/
-    MainActivity.kt      Ed25519 Keystore MethodChannel (StrongBox → TEE fallback)
+    MainActivity.kt      Ed25519 Keystore MethodChannel (StrongBox → TEE fallback);
+                         FLAG_SECURE, BiometricPrompt gate, device integrity check
 ```
 
 ---

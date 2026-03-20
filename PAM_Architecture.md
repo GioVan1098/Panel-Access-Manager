@@ -1,10 +1,12 @@
 # PAM — Panel Access Manager
 ## Technical Architecture & Security Design Document
 
-**Version**: 3.0 (Critical Fixes + Infrastructure Review)
-**Date**: 2026-03-18
-**Status**: Architecture finalized — implementation pending
+**Version**: 3.1 (Android Client Security Hardening)
+**Date**: 2026-03-20
+**Status**: Architecture finalized — implementation complete
 **Origin project**: rofi-bridge (SVA) → evolved into PAM
+
+**Changelog v3.1**: Added Section 20 — Android Client Security Hardening. Three measures implemented: FLAG_SECURE (screen protection), BiometricPrompt soft-gate (optional per-command authentication), device integrity check via Keystore KeyInfo.securityLevel + Build.TAGS (non-blocking, warning levels NONE/MEDIUM/HIGH). Updated Known Limitations (Section 12) with R11 (TEE-less device). Implementation complete, commit 636b0e7.
 
 **Changelog v3.0**: Fixed logical error in WireGuard topology (daemon endpoint is PC wg0 IP 10.0.0.2, not VPS 10.0.0.1). Added nonce cache persistence (SQLite, C1). Added setcap systemd guard (C2). Added Flutter fallback logic hardened→LAN (C3). Added NTP prerequisite (C4). Added PC sleep, client key loss, port conflict residual risks (C5/C6/C7). Added Section 18 (Implementation Pitfalls) and Section 19 (Comparison with existing solutions).
 
@@ -31,6 +33,7 @@
 17. [Untrusted Network Mitigations](#17-untrusted-network-mitigations)
 18. [Implementation Notes — Critical Pitfalls](#18-implementation-notes--critical-pitfalls)
 19. [Comparison with Existing Solutions](#19-comparison-with-existing-solutions)
+20. [Android Client Security Hardening](#20-android-client-security-hardening)
 
 ---
 
@@ -1599,6 +1602,28 @@ This is in contrast to TLS which negotiates cipher suites (and can be downgraded
 
 ---
 
+### R10 — Physical Server Compromise
+
+**Risk**: An attacker with physical access to the PC can read `~/.config/rofi-bridge/server.key`, `ca.crt`, and all client public keys. With `server.key` they can impersonate the server in future connections (partially mitigated by the app's CA pinning — the existing app installation would reject a new server cert). They cannot forge commands without the client's Ed25519 private key (hardware-backed, non-exportable).
+
+**Resolution**: Forward secrecy ensures past traffic cannot be decrypted even with `server.key`. The CA key is encrypted offline in `~/rofi-bridge-ca/ca.key.enc` and never loaded by the daemon. Client credentials on the server are public keys only — a server dump gives zero forging capability.
+
+---
+
+### R11 — TEE-less Device (securityLevel = SOFTWARE)
+
+**Risk**: On a device without a Trusted Execution Environment (emulators, some older or budget devices, certain custom ROMs), `KeyInfo.securityLevel` returns `SOFTWARE`. The Ed25519 private key is stored inside the Android process memory, not in a hardware enclave. On a rooted device, this key is potentially extractable, which undermines the "hardware-backed non-exportable key" guarantee that is foundational to PAM's asymmetric security model.
+
+**Resolution**:
+- `checkDeviceIntegrity()` detects this condition at provisioning time and shows a `warning_level = HIGH` dialog, informing the user that the signing key will not have hardware protection.
+- The user can choose to abort provisioning on this device.
+- If the user proceeds despite the warning (e.g., acceptable risk for their threat model), the remaining five protocol layers (TLS, mTLS, replay protection, privilege isolation, audit) remain intact.
+- In case of suspected key compromise, the device is revoked immediately from the GTK GUI.
+
+**Accepted limitation**: PAM cannot enforce hardware-backed keys. The requirement for API 31+ (minSdk=31 in build.gradle) ensures that TEE is present on the vast majority of compliant Android 12+ devices (Google's Android CDD has mandated TEE since Android 6.0). The software-only path is a documented edge case for non-CDD-compliant devices.
+
+---
+
 ## 13. Verification Plan
 
 ### 13.1 — TLS Security
@@ -2312,7 +2337,131 @@ No existing off-the-shelf tool satisfies all of these simultaneously. SSH provid
 
 ---
 
+---
+
+## 20. Android Client Security Hardening
+
+This section documents the three client-side security measures implemented in `MainActivity.kt` and the Dart layer (commit 636b0e7, 2026-03-20). These measures are independent of and complementary to the six network security layers.
+
+---
+
+### 20.1 — Screen Protection (FLAG_SECURE)
+
+**Problem addressed**: the provisioning screen displays a QR code containing the OTP and server fingerprint. A screenshot, screen recording, or screen sharing session that captures this screen exposes a short-lived but sensitive provisioning token. The home screen reveals the available command set.
+
+**Solution**: `WindowManager.LayoutParams.FLAG_SECURE` is set in `MainActivity.onCreate()`, before the Flutter engine initializes. This marks the Activity's graphics layer as protected content at the SurfaceFlinger (compositor) level.
+
+Effects:
+- Screenshots: black image
+- Screen recording via MediaProjection API: black frames
+- Screen sharing in video calls: receiver sees a black rectangle
+- Recent apps thumbnail: black image
+
+The flag propagates to all screens (home, provisioning, settings) because it is set at the Activity level, not per-screen. No screen transition can leave the app unprotected.
+
+**Relationship to Widevine DRM**: Widevine L1 adds a Protected Memory Path for encrypted video bytes in the hardware decoder pipeline. It is specific to DRM content and irrelevant to PAM. FLAG_SECURE is the correct and sufficient mechanism.
+
+---
+
+### 20.2 — Biometric Authentication Gate
+
+**Problem addressed**: if an unauthorized person obtains physical access to an unlocked phone, they can send commands without any authentication barrier beyond the mTLS and Ed25519 layers, which are transparent to the user at the UI level.
+
+**Solution**: optional per-command authentication via `BiometricPrompt`. Configurable in the Settings screen. When enabled, every command tap triggers a system biometric prompt before the Ed25519 signing operation is called.
+
+**Implementation — soft-gate approach**:
+
+The key is generated without `setUserAuthenticationRequired(true)`. The BiometricPrompt appears before the sign call; if authentication succeeds, `sign()` is called. This is a soft-gate (application-level) rather than a hard-gate (TEE-level with CryptoObject).
+
+Rationale for soft-gate:
+1. The biometric option can be enabled/disabled at any time without re-provisioning the device. A hard-gate would require regenerating the key and re-provisioning.
+2. If the biometric sensor becomes temporarily unavailable, the user can disable the option and continue. With a hard-gate, the key would be inaccessible until the sensor recovers.
+3. For the threat model addressed (unauthorized access on an unlocked phone on a non-rooted device), soft-gate provides equivalent practical protection.
+
+**Authenticators**:
+
+```
+BIOMETRIC_STRONG | DEVICE_CREDENTIAL
+```
+
+BIOMETRIC\_STRONG is required (hardware-backed fingerprint or 3D face recognition). DEVICE\_CREDENTIAL (PIN/password/pattern) is the automatic fallback when strong biometric is unavailable or fails. BIOMETRIC\_WEAK (2D face recognition) is explicitly excluded.
+
+**Availability checking**:
+
+`getBiometricAvailability()` queries `BiometricManager.canAuthenticate()` for each authenticator type and returns a structured map. The Settings screen displays a status string tailored to the specific unavailability reason (NO\_HARDWARE / HW\_UNAVAILABLE / NONE\_ENROLLED / SECURITY\_UPDATE\_REQUIRED).
+
+**Async result pattern**:
+
+BiometricPrompt callbacks execute on the main executor asynchronously relative to the MethodChannel call. The `MethodChannel.Result` object is stored in instance fields `pendingSignResult`, `pendingSignAlias`, `pendingSignData` and completed in `onAuthenticationSucceeded()`. A `return@setMethodCallHandler` guard in the channel handler prevents the outer try-catch from completing the Result before the async callback fires.
+
+---
+
+### 20.3 — Device Integrity Check
+
+**Problem addressed**: PAM's security model assumes that the Android Keystore is hardware-backed (TEE or StrongBox). On a device without TEE (securityLevel = SOFTWARE), the Ed25519 private key is stored in the Android process and is potentially extractable with root access. Additionally, a device with an unlocked bootloader and unofficial firmware may have a modified system. The user should be informed of these conditions at provisioning time.
+
+**Solution**: `checkDeviceIntegrity()` is called before proceeding with provisioning. It returns `{security_level, has_strong_box, is_test_keys, warning_level}`. If `warning_level != NONE`, a dialog is shown with appropriate text. The user can choose to cancel or continue.
+
+**Why not Google Play Integrity API**:
+
+Play Integrity API provides three verdict levels (MEETS\_BASIC\_INTEGRITY, MEETS\_DEVICE\_INTEGRITY, MEETS\_STRONG\_INTEGRITY) but requires Google Play Services, an active internet connection, and a call to Google's infrastructure. PAM is a fully self-hosted system with no external service dependencies. An integrity check that requires phoning home to Google at provisioning time contradicts this design principle. Additionally, Play Integrity does not work on de-Googled devices or AOSP builds without GApps.
+
+The Keystore-based check operates entirely offline via local hardware APIs and is sufficient for the stated purpose.
+
+**Implementation**:
+
+```kotlin
+// Probe TEE security level
+val kpg = KeyPairGenerator.getInstance(KEY_ALGORITHM_EC, "AndroidKeyStore")
+kpg.initialize(KeyGenParameterSpec.Builder(tempAlias, PURPOSE_SIGN)
+    .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+    .setDigests(DIGEST_SHA256).build())
+val keyInfo = KeyFactory.getInstance(KEY_ALGORITHM_EC, "AndroidKeyStore")
+    .getKeySpec(kpg.generateKeyPair().private, KeyInfo::class.java)
+
+// keyInfo.securityLevel:
+// SECURITY_LEVEL_STRONG_BOX          → dedicated secure element
+// SECURITY_LEVEL_TRUSTED_ENVIRONMENT → TEE in main processor
+// SECURITY_LEVEL_UNKNOWN_SECURE      → treated as TRUSTED_ENVIRONMENT
+// (other)                            → SOFTWARE (no TEE)
+```
+
+A separate probe attempts key generation with `setIsStrongBoxBacked(true)` to detect StrongBox presence. Both temporary keys are deleted immediately after the probe.
+
+**Warning levels**:
+
+| Condition | warning_level | Implication |
+|---|---|---|
+| TEE or StrongBox, no test-keys | NONE | Normal operation |
+| test-keys in Build.TAGS | MEDIUM | Unofficial firmware; TEE still present and key is hardware-backed |
+| securityLevel = SOFTWARE | HIGH | No TEE; signing key is software-only; extractable with root |
+
+**Limitation — full attestation chain**:
+
+The current implementation does not perform a full `setAttestationChallenge()` attestation. Full attestation would read `verifiedBootState` and `bootloaderLocked` from the ASN.1 extension in the attestation certificate chain, providing a stronger root-of-trust guarantee. This requires server-side verification of the certificate chain against the Google device attestation root CA. Not implemented in v1; documented as a future extension.
+
+---
+
+### 20.4 — Interaction Between the Three Measures
+
+FLAG\_SECURE is always active, unconditionally, from the moment the Activity starts. It requires no configuration and has no interaction with authentication state.
+
+The biometric gate is checked per-command, only when the preference is enabled. It reads from EncryptedSharedPreferences (Jetpack, key in Android Keystore). The gate is independent of FLAG\_SECURE and of the integrity check.
+
+The integrity check runs once at provisioning, before any cryptographic operation. It has no effect on runtime command sending. The result of the check is not persisted — each provisioning session runs a fresh check.
+
+---
+
+### 20.5 — Residual Risk (added to Section 12)
+
+**R11 — TEE-less device (securityLevel = SOFTWARE)**:
+
+If `checkDeviceIntegrity()` reports `warning_level = HIGH` and the user proceeds, the Ed25519 private key is stored in the Android process memory and is accessible to a process with root privileges. This undermines the "hardware-backed non-exportable key" guarantee that is central to PAM's security model. Mitigation: the warning dialog makes this explicit. Revoking the device from the server immediately removes its access regardless of key state.
+
+---
+
 *Document generated from security analysis sessions, 2026-03-17.*
 *Version 1.0: Core architecture (20 security problems, full asymmetric model).*
 *Version 2.0: Extended with deployment variants, network threat categories, PAM-hardened WireGuard architecture, untrusted network mitigations.*
 *Version 3.0 (2026-03-18): WireGuard topology correction (PC wg0 = 10.0.0.2, VPS = 10.0.0.1 routing hub only). Added: nonce cache SQLite persistence (C1), pam-setcap.service guard (C2), Flutter VPS fallback logic (C3), NTP prerequisite check (C4), PC sleep/WoL limitation (R8), Android key non-exportability (R9), port 443 conflict handling and 8443 alternative (Section 17.1), Section 18 (Implementation Pitfalls), Section 19 (Comparison with existing solutions).*
+*Version 3.1 (2026-03-20): Android client security hardening — FLAG_SECURE, BiometricPrompt soft-gate, device integrity check (Section 20). Updated version and status in header. Added R11 (TEE-less device) to residual risks.*

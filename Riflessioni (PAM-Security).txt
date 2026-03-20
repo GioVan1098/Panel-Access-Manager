@@ -1,0 +1,498 @@
+PAM — Panel Access Manager
+Riflessioni di progettazione: sicurezza del client Android
+===========================================================
+
+Data: 2026-03-20
+Contesto: sessione di analisi pre-implementazione. Le sezioni seguenti documentano il ragionamento tecnico
+che ha portato alle decisioni architetturali implementate in questa sessione. Il documento è inteso come
+riferimento per revisioni di sicurezza future, audit di codice, o estensioni del sistema.
+
+================================================================================
+1. PROTEZIONE DELLO SCHERMO — FLAG_SECURE E IL MODELLO NETFLIX
+================================================================================
+
+1.1 La domanda iniziale
+-----------------------
+
+La domanda era: "Netflix e le app di streaming bloccano screenshot, screen recording e screen sharing a
+livello di kernel — esiste qualcosa di simile per PAM, dato che la schermata di provisioning mostra un QR
+con l'OTP e la schermata principale rivela i comandi disponibili?"
+
+1.2 FLAG_SECURE — il meccanismo corretto
+----------------------------------------
+
+La risposta è che FLAG_SECURE *è* esattamente il meccanismo usato da Netflix, Disney+, app bancarie e
+qualsiasi altra app che blocca la cattura dello schermo. Non è un'alternativa — è lo stesso identico
+meccanismo.
+
+Dal punto di vista implementativo:
+
+    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+
+Questa singola chiamata, effettuata in Activity.onCreate(), comunica al SurfaceFlinger (il compositor
+grafico del kernel Android) di marcare il layer grafico dell'attività come "protected content". Il
+SurfaceFlinger delega la composizione di quel layer direttamente all'Hardware Composer (HWC), bypassando
+qualsiasi path software.
+
+Le conseguenze pratiche sono le seguenti:
+
+    - Screenshot (tasto volume giù + tasto power, API ScreenCapture): ritorna uno schermo nero
+    - Screen recording (MediaProjection API): il frame è nero, il suono eventualmente registrato
+    - Screen sharing (Google Meet, Teams, qualsiasi app via VirtualDisplay): visibile come nero
+    - Task switcher (anteprima delle app recenti): la thumbnail nell'anteprima è nera
+
+Il meccanismo è al di sotto del livello applicativo — nessuna app utente può aggirarlo senza root o
+exploit del kernel. Su un dispositivo non rootato, non esiste nessun punto di intercettazione software
+accessibile dopo che il flag è stato impostato.
+
+1.3 Widevine L1 — la differenza con Netflix
+-------------------------------------------
+
+Netflix fa una cosa aggiuntiva: utilizza Widevine L1 (DRM hardware) per garantire che i byte del video
+decifrato non vengano mai esposti a un buffer accessibile in userspace. Widevine L1 richiede la
+disponibilità di un TEE (Trusted Execution Environment) che processa il video all'interno dell'enclave
+sicura, e usa un Protected Memory Path che va dal decoder hardware alla schermata senza passare per la
+RAM ordinaria.
+
+Questo è specifico per la protezione del contenuto DRM (film in streaming) e non è rilevante per PAM.
+Per PAM, il problema non è proteggere bit di contenuto multimediale ma impedire la cattura dello schermo
+durante operazioni sensibili. FLAG_SECURE è necessario e sufficiente.
+
+1.4 Dove applicare FLAG_SECURE in PAM
+--------------------------------------
+
+FLAG_SECURE è stato applicato a livello di Activity (MainActivity), il che significa che si propaga
+automaticamente a tutti gli schermi dell'applicazione (home, provisioning, settings). Questa scelta è
+più conservativa rispetto ad applicarlo solo su alcune schermate — non richiede coordinazione tra
+schermi e non introduce buchi derivanti da transizioni tra schermate protette e non protette.
+
+Il costo operativo è nullo per l'utente nella maggior parte dei casi. L'unico scenario in cui potrebbe
+essere percepito è la condivisione dello schermo intenzionale durante una chiamata con qualcuno — ma
+tale uso caso non è contemplato nel threat model di PAM (la schermata di controllo dei comandi non
+dovrebbe mai essere condivisa).
+
+
+================================================================================
+2. AUTENTICAZIONE BIOMETRICA — ANALISI COMPLETA
+================================================================================
+
+2.1 Contesto del problema
+--------------------------
+
+La domanda era: aggiungere un gate di autenticazione prima dell'invio di un comando — in modo che anche
+se qualcuno ottiene fisicamente il telefono sbloccato, non possa inviare comandi senza autenticazione.
+Questo copre scenari come telefono lasciato sbloccato sul tavolo, o telefono rubato con schermata ancora
+attiva.
+
+La progettazione di questo gate è non banale perché esiste una varietà di configurazioni hardware e di
+preferenze utente. Analisi completa.
+
+2.2 L'API Android — BiometricManager
+--------------------------------------
+
+Android espone la gerarchia di autenticatori tramite BiometricManager.canAuthenticate(), che accetta
+flag che definiscono il tipo di autenticazione richiesta:
+
+    BIOMETRIC_STRONG  — impronta digitale hardware, riconoscimento facciale 3D (hardware-backed,
+                         verificato sul TEE, resistente a spoofing con foto)
+    BIOMETRIC_WEAK    — riconoscimento facciale 2D (fotocamera frontale, meno sicuro, accettabile
+                         solo per bassa criticità)
+    DEVICE_CREDENTIAL — PIN, pattern, password di sblocco dispositivo
+
+I valori di ritorno che BiometricManager può restituire per ciascun tipo:
+
+    BIOMETRIC_SUCCESS                    → disponibile e registrato, utilizzo immediato possibile
+    BIOMETRIC_ERROR_NO_HARDWARE          → hardware fisicamente assente sul dispositivo
+    BIOMETRIC_ERROR_HW_UNAVAILABLE       → hardware presente ma non disponibile (errore temporaneo
+                                           o guasto permanente del sensore)
+    BIOMETRIC_ERROR_NONE_ENROLLED        → hardware presente e funzionante, ma nessuna biometria
+                                           registrata dall'utente
+    BIOMETRIC_ERROR_SECURITY_UPDATE_REQ  → patch di sicurezza mancante; Android richiede
+                                           aggiornamento prima di consentire l'uso
+
+2.3 Albero decisionale — tutti gli scenari
+-------------------------------------------
+
+La gestione corretta richiede di coprire tutti i rami. Seguendo la gerarchia dal caso migliore al
+più degradato:
+
+    Il dispositivo ha BIOMETRIC_STRONG disponibile e enrollato:
+    ├── Offrire: "Usa impronta / FaceID con PIN come fallback automatico"
+    │   (BIOMETRIC_STRONG | DEVICE_CREDENTIAL come authenticator combinato)
+    ├── Se l'utente non vuole impostarlo: l'opzione rimane disabilitabile nelle impostazioni
+    │   L'utente che disabilita consapevolmente accetta il rischio di uso non autorizzato
+    │   sul telefono sbloccato
+    └── Se il sensore biometrico ha malfunzionamenti (HW_UNAVAILABLE):
+        Android rileva la condizione e propone automaticamente il fallback a DEVICE_CREDENTIAL.
+        BiometricPrompt gestisce questo internamente. Il PAM non deve fare nulla di speciale.
+
+    Il dispositivo NON ha BIOMETRIC_STRONG ma ha DEVICE_CREDENTIAL (PIN/pattern/password):
+    ├── Offrire: "Usa PIN / password"
+    ├── Se l'utente vuole usare solo il PIN: funziona tramite DEVICE_CREDENTIAL
+    └── Se il dispositivo non ha lock screen configurata:
+        Android Keystore con setUserAuthenticationRequired(true) richiede una lock screen
+        come prerequisito; la generazione della chiave fallisce se la lock screen non è
+        configurata. Questo vincolo è imposto dal sistema operativo, non da PAM.
+
+    Il dispositivo ha hardware biometrico ma nessuna biometria enrollata:
+    ├── Informare: "Nessuna biometria registrata. Puoi registrare un'impronta nelle
+    │   impostazioni Android oppure usare PIN/password."
+    └── Se l'utente preferisce non enrollare: offrire DEVICE_CREDENTIAL come alternativa
+
+    Il dispositivo non ha nessun authenticator disponibile (no hardware, no lock screen):
+    └── L'opzione di autenticazione non viene mostrata nelle impostazioni di PAM.
+        Non è possibile forzare un'autenticazione se il sistema non la supporta.
+
+La scelta implementativa di PAM è BIOMETRIC_STRONG | DEVICE_CREDENTIAL come coppia di authenticator.
+Questo è il pattern raccomandato da Google per app ad alta sicurezza: il sistema tenta prima la
+biometria forte, e passa automaticamente al PIN/password se la biometria fallisce o non è disponibile.
+L'utente non deve fare nessuna scelta manuale nel caso normale.
+
+2.4 L'autenticazione è opzionale per design
+---------------------------------------------
+
+L'autenticazione biometrica in PAM è configurabile, non obbligatoria. Questa scelta è deliberata:
+
+a) Il threat model principale di PAM è un attaccante di rete, non un attaccante con accesso fisico al
+   telefono. I sei layer di sicurezza esistenti (TLS, mTLS, Ed25519, nonce, setcap, audit) coprono
+   l'attacco di rete. La biometria aggiunge protezione contro l'accesso fisico non autorizzato.
+
+b) Forzare la biometria su dispositivi che non la supportano (ERROR_NO_HARDWARE) o su utenti con
+   hardware guasto (HW_UNAVAILABLE) renderebbe l'app inutilizzabile senza motivo tecnico.
+
+c) Il pattern corretto per questa categoria di app è quello usato dalla maggior parte delle app di
+   banking: l'autenticazione biometrica è fortemente raccomandata e il suo stato è segnalato in modo
+   chiaro (es. "Biometric: enabled/disabled"), ma l'utente che la disabilita consapevolmente può farlo.
+
+2.5 Soft-gate vs CryptoObject — la scelta architetturale
+---------------------------------------------------------
+
+Esistono due modalità principali di utilizzo di BiometricPrompt:
+
+    Modalità 1 — Hard-gate (CryptoObject):
+    La chiave Ed25519 viene generata con setUserAuthenticationRequired(true). Per firmare, Android
+    richiede che la Signature sia presentata come CryptoObject a BiometricPrompt. La firma avviene
+    all'interno del TEE solo dopo che il TEE stesso ha ricevuto la conferma di autenticazione.
+    La chiave non può fisicamente essere usata senza autenticazione — il blocco è hardware-level.
+
+    Modalità 2 — Soft-gate (senza CryptoObject):
+    La chiave Ed25519 è generata normalmente (senza setUserAuthenticationRequired). BiometricPrompt
+    viene usato come gate applicativo: se l'autenticazione ha successo, l'app chiama sign(); se
+    fallisce, l'app non chiama sign(). Il blocco è software-level nell'app, non hardware-level
+    nel TEE.
+
+Per PAM è stata scelta la modalità soft-gate per i seguenti motivi:
+
+1. Retrocompatibilità: un utente che aveva già provisionato il dispositivo senza biometrica non deve
+   cancellare la chiave e riprovisionare per abilitare l'autenticazione. Con hard-gate, cambiare il
+   flag userAuthenticationRequired richiede di rigenerare la chiave — il che significa revocare
+   il dispositivo esistente e rifare il provisioning completo. Con soft-gate, l'opzione è
+   configurabile in runtime senza toccare le chiavi.
+
+2. Usabilità: se il sensore biometrico va temporaneamente fuori uso (HW_UNAVAILABLE), con soft-gate
+   l'utente può disabilitare la biometrica e continuare a usare PAM con PIN. Con hard-gate, la chiave
+   sarebbe bloccata a livello TEE e inaccessibile finché l'hardware non torna disponibile.
+
+3. Il modello di minaccia non richiede hard-gate: un attaccante che ha compromesso l'app a livello
+   di processo (es. root + frida) può aggirare entrambe le modalità. La soft-gate su un dispositivo
+   non rootato fornisce la stessa protezione utente pratica dell'hard-gate per gli scenari di accesso
+   fisico non autorizzato al telefono sbloccato.
+
+2.6 L'attacco "fake biometric response"
+-----------------------------------------
+
+Una preoccupazione legittima sollevata durante l'analisi: "se il processo di autenticazione è visibile,
+potrebbero mandare dati falsi quando viene richiesta la biometria/password per farla sempre accettare".
+
+Questo attacco non è praticabile su un dispositivo non rootato per i seguenti motivi strutturali:
+
+1. BiometricPrompt non è un componente dell'app. È un componente di SystemUI — il processo di sistema
+   separato che gestisce la UI del sistema operativo (barra di stato, notifiche, dialoghi di sistema).
+   SystemUI gira in un processo con UID system (1000), distinto dall'UID dell'app (assegnato al momento
+   dell'installazione). I processi non hanno accesso alla memoria di altri processi su Android.
+
+2. Il matching biometrico avviene all'interno del TEE (o StrongBox). I template biometrici
+   dell'utente sono memorizzati cifrati nel TEE e non escono mai dall'enclave — neanche come testo
+   cifrato nella RAM ordinaria. Il confronto tra il campione presentato (impronta letta dal sensore)
+   e il template registrato avviene interamente dentro il TEE.
+
+3. Il risultato del match (successo/fallimento) viene comunicato dal TEE al Keystore Android tramite un
+   canale interno sicuro, senza passare attraverso il processo dell'app né attraverso la RAM
+   ordinaria. L'app riceve solo il callback onAuthenticationSucceeded() — non vede mai il risultato
+   crittografico dell'attestazione biometrica, solo il segnale di "accesso consentito".
+
+4. Un overlay malicious non può coprire BiometricPrompt: Android dal API 29 blocca attivamente le
+   finestre overlay sopra prompt di sistema sensibili.
+
+La conclusione è che il modello di minaccia "fake biometric" non è praticabile senza compromissione
+del kernel o del TEE, che escono dallo scope definito come non-goal nel threat model di PAM.
+
+
+================================================================================
+3. RILEVAMENTO ROOT E INTEGRITÀ DEL DISPOSITIVO
+================================================================================
+
+3.1 Il problema del root — landscape corrente
+----------------------------------------------
+
+Root su Android nel 2026 si ottiene principalmente attraverso tre framework:
+
+    Magisk (e varianti: Delta, Kitsune, Alpha):
+    Opera a livello di init / ramdisk. Monta un filesystem overlay sopra la partizione di sistema,
+    mantiene il sistema originale intatto sul disco. Offre Zygisk (iniezione nel processo Zygote,
+    il parent di tutte le app Android) e la funzionalità DenyList che nasconde la presenza di root
+    a specifiche app. Magisk nasconde se stesso dal rilevamento basato su filesystem e package names
+    quando DenyList è abilitato.
+
+    KernelSU (e varianti: KernelSU-Next, MKSU):
+    Implementa il root a livello di kernel tramite una patch al kernel di Android. Offre un meccanismo
+    di revoca a grana più fine rispetto a Magisk. Più difficile da rilevare in userspace perché opera
+    a un livello inferiore — un'app non può facilmente distinguere un kernel modificato con KernelSU
+    da un kernel stock analizzando processi o file in /proc.
+
+    APatch:
+    Combina patch kernel + hooking applicativo. Simile a KernelSU nell'approccio kernel-level.
+
+3.2 Perché i metodi naive falliscono
+--------------------------------------
+
+I metodi di root detection basati su userspace sono facilmente aggirabili:
+
+    Ricerca di binari (su, busybox, magisk):
+    Magisk con MagicMount nasconde questi path tramite bind mount overlay. Dal punto di vista
+    dell'app, i path non esistono. KernelSU non installa binari visibili.
+
+    Controllo del package manager (pm list packages | grep magisk):
+    Nascosto da Zygisk + DenyList su Magisk. KernelSU non ha un package manager-visible package.
+
+    Controllo di ro.build.tags == "test-keys":
+    Un indicatore utile (dispositivi stock hanno "release-keys") ma non affidabile: custom ROM
+    che implementano Verified Boot correttamente possono avere "release-keys" anche con bootloader
+    sbloccato.
+
+    Controllo di ro.debuggable, ro.secure:
+    Modificabili da un build rootato. Non affidabili.
+
+La conclusione è che qualsiasi rilevamento in userspace può essere aggirato da un attaccante
+sufficientemente motivato con un framework root aggiornato.
+
+3.3 Il metodo corretto — Android Keystore Attestation
+------------------------------------------------------
+
+L'approccio hardware-based è l'unico che non può essere aggirato in userspace. Il meccanismo:
+
+Quando si genera una chiave nel Android Keystore passando setAttestationChallenge(nonce), il TEE
+(o StrongBox) genera una catena di certificati X.509 firmata dalla chiave di attestazione del
+dispositivo (Root of Trust). Questa catena include un'estensione ASN.1 proprietaria (OID
+1.3.6.1.4.1.11129.2.1.17) che contiene, tra l'altro:
+
+    verifiedBootState:
+        VERIFIED         → bootloader bloccato, firma del kernel verificata (stock, non rootato)
+        SELF_SIGNED      → bootloader sbloccato, kernel firmato con chiave custom
+        UNVERIFIED       → bootloader sbloccato, kernel non firmato o firma non verificata
+        FAILED           → verifica del boot fallita (kernel modificato)
+
+    deviceLocked:
+        true             → bootloader bloccato al momento dell'attestazione
+        false            → bootloader sbloccato
+
+    securityLevel:
+        STRONG_BOX       → chiave generata e attestata nel dedicated secure element (chip separato)
+        TRUSTED_ENVIRONMENT → chiave nel TEE software-hardware del processore principale
+        SOFTWARE         → chiave nel processo Android, nessun TEE (emulatore, dispositivo senza TEE)
+
+    attestationChallenge:
+        Il nonce fornito dal chiamante — garantisce che l'attestazione sia fresca e non un replay
+        di una attestazione precedente.
+
+Un framework root che voglia superare questa attestazione dovrebbe compromettere il TEE o il
+secure element — operazioni che richiedono vulnerabilità hardware/firmware, non software in
+userspace. Magisk, KernelSU e APatch non modificano il TEE.
+
+3.4 Play Integrity API — analisi e rifiuto per PAM
+---------------------------------------------------
+
+Le app bancarie (Intesa Sanpaolo, Revolut, Wise, N26) usano comunemente la Play Integrity API,
+che offre tre livelli di verdetto:
+
+    MEETS_BASIC_INTEGRITY:
+    Indica che il dispositivo non ha segni evidenti di manomissione (no root tool ovvi,
+    no emulatore non mascherato). Basato su controlli software e firma APK.
+    Requisito: Google Play Services.
+
+    MEETS_DEVICE_INTEGRITY:
+    Il dispositivo ha superato i test CTS (Compatibility Test Suite) di Google — è un dispositivo
+    certificato con build Android ufficiale. Basato su hardware attestation ma delegato
+    all'infrastruttura Google.
+    Requisito: Google Play Services + internet + dispositivo certificato GMS.
+
+    MEETS_STRONG_INTEGRITY:
+    Aggiunge Android update recente (patch level recente) ai requisiti precedenti.
+    Requisito: come sopra + dispositivo aggiornato.
+
+Motivi per cui Play Integrity API è stata rifiutata per PAM:
+
+    1. Dipendenza da Google Play Services: non tutti i dispositivi Android hanno GPS. Dispositivi
+       de-Googled, ROM custom senza GApps, tablet aziendali con Android Enterprise, dispositivi
+       in mercati dove GPS è limitato — tutti questi escono dal perimetro di PAM inutilmente.
+
+    2. Dipendenza da internet: Play Integrity richiede una chiamata a server Google per ottenere
+       il token di integrità. PAM è progettato per funzionare su rete locale senza internet (VPS
+       opzionale per hardened). Imporre una dipendenza internet su Google per un'operazione locale
+       contraddice la filosofia self-hosted.
+
+    3. Dipendenza da un terzo: Google è nell'infrastruttura critica per ogni controllo di integrità.
+       Un'interruzione del servizio Play Integrity blocca potenzialmente l'applicazione.
+
+    4. Filosofia self-hosted: PAM è completamente self-hosted per design — nessuna dipendenza da
+       SaaS esterni nella catena di fiducia. La Play Integrity API introduce Google come trust anchor
+       esterno per ogni verifica di integrità del client.
+
+La soluzione adottata è la Keystore Attestation locale, che:
+    - Non richiede GPS
+    - Non richiede internet (la verifica avviene analizzando la catena di certificati in locale)
+    - Non dipende da Google nella catena di fiducia runtime
+    - Funziona su qualsiasi dispositivo con TEE, anche su ROM custom con GPS rimosso
+    - Fornisce dati attestati hardware, non solo euristica software
+
+3.5 Comportamento scelta — non bloccante, informativo
+------------------------------------------------------
+
+L'approccio implementativo rispecchia quello di Magisk stesso: l'applicazione informa l'utente
+dello stato del dispositivo ma non blocca l'uso in modo forzato.
+
+La giustificazione è la seguente: un utente che usa Magisk su un dispositivo ha consapevolmente
+scelto di sbloccare il bootloader e installare un framework root. È un utente tecnico che comprende
+le implicazioni. PAM non deve decidere al suo posto che non può usare l'applicazione. L'approccio
+corretto è il consenso informato: il dispositivo ha questa configurazione, queste sono le implicazioni,
+vuoi continuare?
+
+La distinzione tra livelli di allerta:
+
+    NONE: dispositivo stock, TEE verificato, BIOMETRIC_SUCCESS o DEVICE_CREDENTIAL disponibile.
+          Nessuna azione richiesta.
+
+    MEDIUM (warning_level): Build.TAGS contiene "test-keys" (indicatore di build non ufficiale)
+          ma il TEE è presente e funzionante. La chiave Ed25519 è comunque hardware-backed.
+          Il rischio aggiuntivo è che la build non ufficiale potrebbe avere modifiche non verificate
+          al firmware. L'utente è informato e può continuare.
+
+    HIGH (warning_level): securityLevel del Keystore è SOFTWARE. Nessun TEE. La chiave Ed25519
+          è memorizzata in software, nel processo Android, potenzialmente accessibile su root.
+          Questo è il caso più serio: l'assunzione fondamentale del design PAM (chiave
+          non estraibile dall'hardware) non è soddisfatta. L'utente è informato con un messaggio
+          chiaro che la sicurezza è significativamente ridotta.
+
+3.6 Limitazione dell'implementazione attuale rispetto all'attestation completa
+-------------------------------------------------------------------------------
+
+L'implementazione attuale di PAM usa KeyInfo.securityLevel per determinare il livello di sicurezza
+della chiave, e Build.TAGS per il controllo test-keys. Non effettua una full attestation chain
+verification con challenge nonce.
+
+La full attestation richiederebbe:
+    1. Generare un nonce casuale sul server
+    2. Passarlo come setAttestationChallenge(nonce) durante generateKeyPair() sul client
+    3. Richiedere la catena di certificati (getKeyPairAttestationCertificates())
+    4. Inviarla al server che verifica la firma della catena con la chiave Google root e legge
+       l'estensione ASN.1 con verifiedBootState
+
+Questo approccio più rigoroso non è stato implementato nella versione corrente per i seguenti motivi:
+
+    - Richiede parsing ASN.1 dell'estensione OID 1.3.6.1.4.1.11129.2.1.17 — libreria custom
+      necessaria in Dart/Kotlin
+    - Richiede che il server validi la catena verso la root CA di Google (o gestisca offline le
+      chiavi hardware degli OEM) — introduce complessità nella PKI del server
+    - La protezione aggiuntiva rispetto a KeyInfo.securityLevel è rilevante principalmente per
+      distinguere un TEE valido da un TEE compromesso a livello firmware — scenario fuori dallo
+      scope del threat model corrente
+
+KeyInfo.securityLevel + Build.TAGS è sufficiente per l'obiettivo dichiarato: informare l'utente
+sulla postura di sicurezza del dispositivo senza bloccare l'uso.
+
+L'implementazione dell'attestation completa è documentata come possibile estensione futura.
+
+
+================================================================================
+4. TABELLA RIEPILOGATIVA — DECISIONI FINALI
+================================================================================
+
+    ┌────────────────────────────┬──────────────────────────────────────────────┬──────────────────────────────────┐
+    │          Feature           │              Approccio scelto                │               Note               │
+    ├────────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────┤
+    │ Screen protection          │ FLAG_SECURE su Activity (tutti gli schermi)  │ Stesso meccanismo Netflix/banking │
+    ├────────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────┤
+    │ Auth comandi               │ BiometricPrompt soft-gate, opzionale         │ BIOMETRIC_STRONG | DEVICE_CRED.  │
+    ├────────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────┤
+    │ Modalità auth              │ Soft-gate (senza CryptoObject)               │ No re-provisioning per abilitare │
+    ├────────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────┤
+    │ Root detection             │ KeyInfo.securityLevel + Build.TAGS           │ Offline, no GPS, no internet     │
+    ├────────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────┤
+    │ Play Integrity API         │ Rifiutata                                    │ Dipendenza GPS + Google + internet│
+    ├────────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────┤
+    │ Comportamento su root/TEE- │ Warning + scelta utente (non bloccante)      │ Modello consenso informato       │
+    ├────────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────┤
+    │ Fake biometric attack      │ Non praticabile su dispositivo non rootato   │ BiometricPrompt in SystemUI      │
+    ├────────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────┤
+    │ Full attestation chain     │ Non implementata (v1)                        │ Estensione futura documentata    │
+    └────────────────────────────┴──────────────────────────────────────────────┴──────────────────────────────────┘
+
+
+================================================================================
+5. CONSIDERAZIONI SULL'INTERAZIONE TRA LE TRE FEATURE
+================================================================================
+
+Le tre feature implementate operano in modo indipendente ma complementare:
+
+FLAG_SECURE è sempre attivo, senza interazione con le altre feature. Agisce a livello grafico
+prima ancora che l'app abbia completato qualsiasi logica applicativa.
+
+Il gate biometrico agisce nel momento in cui l'utente tenta di inviare un comando. È controllato
+da una preferenza configurabile. La preferenza è memorizzata in EncryptedSharedPreferences tramite
+flutter_secure_storage, che su Android usa l'API Jetpack EncryptedSharedPreferences con chiave
+gestita dal Android Keystore — la preferenza "biometric: true" è quindi cifrata a riposo.
+
+Il controllo di integrità agisce al momento del provisioning, prima che qualsiasi operazione
+crittografica venga effettuata. Se il dispositivo presenta un warning_level HIGH e l'utente sceglie
+di continuare, questa scelta vale solo per quella sessione di provisioning — il controllo viene
+ripetuto ad ogni provisioning futuro.
+
+Il fatto che le tre feature siano indipendenti significa che possono essere aggiornate, rimosse
+o estese separatamente senza impatto sulle altre.
+
+
+================================================================================
+6. NOTE SUI LIMITI RESIDUI DEL CLIENT ANDROID
+================================================================================
+
+Il seguente insieme di limitazioni è accettato nel threat model corrente:
+
+    L1 — Dispositivo rootato con framework avanzato (Zygisk + DenyList aggressivo):
+    Su un dispositivo rootato con un framework root sufficientemente aggressivo, il controllo
+    di integrità potrebbe non rilevare la root. La chiave Ed25519, se generata su un dispositivo
+    senza StrongBox ma con TEE, resta hardware-backed — non estraibile senza attacchi al firmware.
+    Su dispositivo senza TEE (securityLevel = SOFTWARE), la chiave è in software ed è in
+    principio estraibile con root.
+
+    L2 — Frida / hooking dinamico:
+    Un attaccante con root e Frida può hookkare onAuthenticationSucceeded() e farlo chiamare
+    artificialmente. Il soft-gate biometrico è bypassabile con root + hooking. Questo è un
+    non-goal esplicito del threat model (compromissione del kernel è fuori scope).
+
+    L3 — Backup di flutter_secure_storage:
+    Su alcuni dispositivi / configurazioni di backup, EncryptedSharedPreferences potrebbe essere
+    incluso in un backup non cifrato. I valori che PAM memorizza (ca_cert, tls_cert, tls_key)
+    se estratti non consentono di firmare comandi (la chiave signing è nel Android Keystore
+    hardware, non in flutter_secure_storage), ma potrebbero consentire connessioni mTLS verso
+    il server. La chiave privata TLS client è in flutter_secure_storage — questo è il limite
+    maggiore dell'approccio.
+
+    Mitigazione L3: la chiave TLS client è revocabile dal server cancellando clients/<device_id>/.
+    In caso di sospetta compromissione, revocare il dispositivo dalla GUI in meno di 30 secondi.
+
+Questi limiti sono documentati anche in PAM_Architecture.md, Sezione 12 (Residual Risks).
+
+================================================================================
+
+Documento redatto in sessione di analisi tecnica pre-implementazione, 2026-03-20.
+Riferimento implementativo: commit 636b0e7, repository GioVan1098/Panel-Access-Manager.

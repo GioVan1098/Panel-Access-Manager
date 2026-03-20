@@ -163,6 +163,111 @@ A router-based VPN (OpenVPN, WireGuard on router) gives the phone full LAN acces
 
 ---
 
+## Android client hardening
+
+Beyond the cryptographic protocol layers, the Android app implements three independent security measures that address physical access and device integrity scenarios.
+
+### Screen protection — FLAG_SECURE
+
+`WindowManager.LayoutParams.FLAG_SECURE` is set in `MainActivity.onCreate()`:
+
+```kotlin
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+}
+```
+
+This is the same mechanism used by banking apps, Netflix, and Disney+. The flag instructs SurfaceFlinger (Android's graphics compositor) to mark the Activity's layer as protected content. The Hardware Composer handles the buffer directly without going through any software capture path. Practical effects: all screenshots return a black image, screen recording captures black frames, screen sharing (Google Meet, Teams) shows a black rectangle, recent apps thumbnails are black.
+
+Netflix adds Widevine L1 DRM on top (for encrypted video bytes in the decoder pipeline); that is specific to DRM content and not relevant for PAM. FLAG\_SECURE alone is the correct and sufficient mechanism for PAM's purpose.
+
+The flag is applied at the Activity level, covering all screens (home, provisioning, settings). This avoids gaps that could arise from applying protection only to specific screens and leaving transitions unprotected.
+
+### Biometric authentication gate
+
+The app supports an optional per-command biometric confirmation, configurable in Settings. The implementation uses `BiometricPrompt` from the `androidx.biometric` library with `FlutterFragmentActivity` as the Activity base class (required by BiometricPrompt's Fragment-based API).
+
+**Why soft-gate over CryptoObject hard-gate:**
+
+Two modes exist for BiometricPrompt:
+
+1. **Hard-gate (CryptoObject)**: the Ed25519 key is generated with `setUserAuthenticationRequired(true)`. The key is cryptographically locked inside the TEE until a biometric match is confirmed by the TEE itself. This is the most secure option, but it requires regenerating the key — and therefore re-provisioning the device — every time the option is toggled. It also makes the key permanently inaccessible if the biometric sensor is temporarily unavailable.
+
+2. **Soft-gate (no CryptoObject)**: BiometricPrompt gates the `sign()` call at the application level. If authentication succeeds, the app proceeds to sign; if it fails or is cancelled, the app does not. The block is software-level in the app process, not hardware-level in the TEE.
+
+PAM uses soft-gate because the biometric option must be configurable at runtime without re-provisioning. A user who provisioned without biometric enabled should be able to enable it later without repeating the full provisioning flow. The security guarantees are equivalent for the target scenario (unauthorized access on an unlocked phone) on a non-rooted device.
+
+**Authenticator configuration:**
+
+```kotlin
+BiometricManager.Authenticators.BIOMETRIC_STRONG or
+BiometricManager.Authenticators.DEVICE_CREDENTIAL
+```
+
+This is the recommended configuration for high-security apps: BIOMETRIC\_STRONG is preferred (hardware-backed fingerprint, 3D face), with automatic fallback to PIN/password if biometric is unavailable or enrolled biometrics fail. The app queries `BiometricManager.canAuthenticate()` before offering the option in Settings, and shows descriptive messages for each unavailability reason (NO\_HARDWARE, HW\_UNAVAILABLE, NONE\_ENROLLED, SECURITY\_UPDATE\_REQUIRED).
+
+**Async MethodChannel result:**
+
+BiometricPrompt callbacks are asynchronous. The MethodChannel `Result` for `signWithBiometric` is stored in instance fields (`pendingSignResult`, `pendingSignAlias`, `pendingSignData`) and completed in `onAuthenticationSucceeded()`. The `return@setMethodCallHandler` guard prevents the outer try-catch from resolving the Result prematurely. `BIOMETRIC_CANCELLED` errors are handled silently on the Dart side (no red error shown for intentional cancellation).
+
+### Device integrity check
+
+At provisioning time, the app calls `checkDeviceIntegrity()` before proceeding, to inform the user of the device's security posture. The check uses Android Keystore APIs entirely — no network, no Google Play Services.
+
+**Why Keystore Attestation over Play Integrity API:**
+
+| | Keystore (PAM approach) | Play Integrity API |
+|---|---|---|
+| Requires Google Play Services | No | Yes |
+| Requires internet | No | Yes |
+| Trust anchor | Hardware TEE / Google device CA | Google infrastructure |
+| Works on de-Googled ROMs | Yes | No |
+| Works offline | Yes | No |
+
+The Play Integrity API requires a Google account infrastructure call for every check. PAM is designed to be self-hosted with no external dependencies. An integrity check that requires phoning home to Google at every provisioning contradicts this principle.
+
+**Implementation — what is checked:**
+
+```kotlin
+// 1. Probe TEE security level via a temp P-256 key and KeyInfo
+val kpg = KeyPairGenerator.getInstance(KEY_ALGORITHM_EC, "AndroidKeyStore")
+kpg.initialize(KeyGenParameterSpec.Builder(tempAlias, PURPOSE_SIGN)
+    .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+    .setDigests(DIGEST_SHA256).build())
+val keyPair = kpg.generateKeyPair()
+val keyInfo = KeyFactory.getInstance(KEY_ALGORITHM_EC, "AndroidKeyStore")
+    .getKeySpec(keyPair.private, KeyInfo::class.java)
+// keyInfo.securityLevel: STRONG_BOX | TRUSTED_ENVIRONMENT | SOFTWARE
+
+// 2. Probe StrongBox separately (try generation with setIsStrongBoxBacked(true))
+
+// 3. Check build tags
+val isTestKeys = Build.TAGS.contains("test-keys")
+```
+
+A temporary key is generated only for the probe and immediately deleted. The check adds no persistent state.
+
+**Warning levels:**
+
+- `NONE`: TEE or StrongBox present, no test-keys. No action.
+- `MEDIUM`: test-keys build (possible unofficial firmware). TEE still present. Warning dialog with Continue / Cancel.
+- `HIGH`: `securityLevel == SOFTWARE` (no TEE). The core security assumption of PAM — hardware-backed non-exportable signing key — is not met. Warning dialog with Proceed anyway / Cancel.
+
+The approach is non-blocking: an informed user (e.g., one who uses Magisk deliberately) can choose to continue.
+
+**Limitation of the current implementation:**
+
+The current check uses `KeyInfo.securityLevel` without a full attestation challenge. A full attestation would require:
+1. Server generates a nonce
+2. Client passes it as `setAttestationChallenge(nonce)` at key generation
+3. Client sends the resulting certificate chain to the server
+4. Server verifies the chain up to the Google device attestation root and reads `verifiedBootState` / `bootloaderLocked` from the ASN.1 extension (OID 1.3.6.1.4.1.11129.2.1.17)
+
+This would distinguish a stock non-rooted device (VERIFIED) from one with unlocked bootloader more reliably than Build.TAGS. It is not implemented in the current version due to the ASN.1 parsing complexity and the server-side PKI changes required. Documented as a future extension.
+
+---
+
 ## Android Keystore: implementation notes
 
 Ed25519 in the Android Keystore requires API 31+. The implementation:
@@ -194,6 +299,7 @@ Android Keystore keys are not included in Android backups. Phone loss means re-p
 | R8 | PC sleep breaks WireGuard keepalive | Commands in 25s window silently dropped | Health check before command; Wake-on-LAN as complement |
 | R9 | Ed25519 keys non-exportable from Keystore | Phone loss requires re-provisioning | Revoke from GUI, re-provision in ~2 minutes |
 | R10 | Physical server compromise | Attacker gets `server.key`, `ca.crt`, client public keys | Forward secrecy protects past traffic; CA offline limits damage |
+| R11 | TEE-less device (securityLevel = SOFTWARE) | Ed25519 key stored in process memory, extractable with root | `checkDeviceIntegrity()` warns at provisioning; user can abort; five other layers remain intact |
 
 None of these are considered blocking for the target use case (single trusted device, home/office network, known physical environment).
 
