@@ -23,33 +23,39 @@ Same daemon, same GUI, same app — only the transport layer differs.
 3. **Ed25519 command signing** — Android Keystore hardware-backed key, non-exportable
 4. **Replay protection** — timestamp ±30s + one-time nonce (SQLite, survives daemon restart)
 5. **Privilege isolation** — `ipt-helper` C binary with `cap_net_admin` setcap; zero sudoers
-6. **Audit log** — append-only, HMAC-SHA256 per entry with server signing key
+6. **Audit log** — append-only, Ed25519 asymmetric signature per entry; verifiable with `audit_sign.pub` (server never needs to hold a forgeable key)
 
-*PAM-hardened adds Layer 0: WireGuard — ChaCha20-Poly1305, Noise\_IKpsk2 protocol.*
+*PAM-hardened adds Layer 0: WireGuard — ChaCha20-Poly1305, Noise\_IKpsk2 protocol with per-peer pre-shared key (PSK).*
 
 ## Android client security
 
-The Android app implements three additional hardening measures independent of the network security layers:
+The Android app implements additional hardening measures independent of the network security layers:
 
 | Feature | Mechanism | Effect |
 |---|---|---|
 | **Screen protection** | `FLAG_SECURE` (WindowManager) | Blocks screenshots, screen recording, screen sharing at the SurfaceFlinger compositor level — identical to the mechanism used by banking and streaming apps |
-| **Biometric gate** | `BiometricPrompt` (BIOMETRIC\_STRONG \| DEVICE\_CREDENTIAL) | Optional per-command authentication confirmation; configurable in Settings; degrades gracefully based on device capability |
+| **Biometric gate — soft-gate** | `BiometricPrompt` (BIOMETRIC\_STRONG \| DEVICE\_CREDENTIAL) | Optional per-command authentication confirmation; configurable in Settings at any time without re-provisioning; degrades gracefully based on device capability |
+| **Biometric gate — hard-gate** | `BiometricPrompt` with `CryptoObject` (TEE-enforced) | Selected at provisioning time; key generated with `setUserAuthenticationRequired(true)` + `setInvalidatedByBiometricEnrollment(true)`; signing physically impossible without a fresh biometric match inside the TEE; only `BIOMETRIC_STRONG` accepted (no PIN fallback) |
+| **Backup lockout** | `android:allowBackup="false"` in AndroidManifest | Prevents recovery of `flutter_secure_storage` TLS keys via Android cloud or local backup |
+| **Wake-on-LAN** | UDP magic packet (port 9) sent before each command | Wakes PC from light sleep before the command arrives; configurable in Settings; PAM direct uses LAN broadcast, PAM-hardened uses WireGuard unicast to 10.0.0.2 |
 | **Device integrity check** | Android Keystore `KeyInfo.securityLevel` + `Build.TAGS` | Detects absence of TEE / StrongBox and test-keys builds at provisioning time; warning dialog with user choice (non-blocking) |
+| **Hardware key attestation** | Android Keystore `setAttestationChallenge()` + Google Hardware Attestation Root CA chain verification (`attestation.py`) | At provisioning, the server optionally verifies that the signing key was generated inside the device TEE or StrongBox and that the verified boot state is intact; best-effort — gracefully falls back if unavailable; configurable per deployment in `config.toml [attestation]` |
 
-The biometric gate uses a soft-gate approach (no `CryptoObject` binding), which means it can be enabled or disabled at any time without re-provisioning the device. The device integrity check does not use Google Play Integrity API — it operates entirely offline via the hardware Keystore.
+The security mode (soft-gate vs hard-gate) is chosen at first provisioning and is baked into the key flags; switching requires re-provisioning. The device integrity check does not use Google Play Integrity API — it operates entirely offline via the hardware Keystore. Key attestation is a separate, server-side verification using the Google Hardware Attestation Root CA bundle.
 
 ---
 
 ## Repository structure
 
 ```
-PAM_Architecture.md      full security design document (v3.0, 19 sections)
+PAM_Architecture.md      full security design document (v3.3, 20 sections)
 pam-daemon/
-  bridge_v2.py           HTTPS daemon (mTLS, Ed25519, SQLite nonces, HMAC audit)
+  bridge_v2.py           HTTPS daemon (mTLS, Ed25519 verify, SQLite nonces, Ed25519 audit, attestation)
   ipt-helper.c           C privilege helper (setcap cap_net_admin, execv iptables)
-  setup.sh               installer: CA, certs, ipt-helper, systemd services
-  relay-setup.sh         VPS-side WireGuard setup (PAM-hardened only)
+  setup.sh               installer: CA, certs, audit keys, ipt-helper, systemd services [--wol]
+  relay-setup.sh         VPS-side WireGuard setup with PSK generation (PAM-hardened only)
+  attestation.py         Android Key Attestation chain verifier (DER TLV parser, policy engine)
+  attestation_roots.pem  Google Hardware Attestation Root CA bundle (RSA-4096 + EC P-384)
   gui/
     main.c               GTK3 GUI entry point
     gui_gtk.c/h          4-tab notebook: Status, Provision, Devices, Audit Log
@@ -58,12 +64,12 @@ pam-daemon/
     Makefile
 pam_app/                 Flutter Android app
   lib/
-    screens/             Home (commands), Provisioning (QR scan), Settings
-    services/            mTLS HTTP, Ed25519 Keystore, crypto, storage
+    screens/             Home (commands + WoL), Provisioning (QR scan + security mode), Settings
+    services/            mTLS HTTP, Ed25519 Keystore, crypto (soft+hard-gate), storage, WoL
     models/              PamCommand enum, PamConfig
   android/
     MainActivity.kt      Ed25519 Keystore MethodChannel (StrongBox → TEE fallback);
-                         FLAG_SECURE, BiometricPrompt gate, device integrity check
+                         hard-gate CryptoObject; FLAG_SECURE; BiometricPrompt; integrity check
 ```
 
 ---
@@ -74,23 +80,26 @@ pam_app/                 Flutter Android app
 # 1. Build and install the GUI
 cd pam-daemon/gui && make && make install
 
-# 2. Run setup (generates CA, server cert, installs ipt-helper with setcap)
-cd pam-daemon && bash setup.sh
+# 2. Run setup (generates CA, server cert, audit keys, installs ipt-helper with setcap)
+#    Add --wol to also detect LAN MAC and enable Wake-on-LAN support
+cd pam-daemon && bash setup.sh          # basic
+# cd pam-daemon && bash setup.sh --wol  # with Wake-on-LAN
 
 # 3. Start the daemon
 systemctl --user enable --now rofi-bridge
 
 # 4. Open the GUI, go to Provision tab, generate OTP, scan QR from Android app
+#    The app will ask you to choose security mode (standard / hardened) at first provisioning
 pam-gui
 ```
 
 For PAM-hardened (WireGuard relay):
 
 ```bash
-# On the VPS
+# On the VPS — generates per-peer PSKs; save the output
 bash relay-setup.sh
 
-# On the PC
+# On the PC — enter PC_PSK from relay-setup.sh output when prompted
 bash setup.sh --hardened
 ```
 

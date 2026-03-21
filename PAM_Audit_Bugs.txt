@@ -1,0 +1,266 @@
+PAM CODEBASE AUDIT — 60 ISSUES
+Audit date: 2026-03-21
+Files audited: bridge_v2.py, attestation.py, ipt-helper.c, sys.c, setup.sh,
+               relay-setup.sh, config.dart, build.gradle, MainActivity.kt,
+               provisioning_screen.dart, http_service.dart, keystore_service.dart,
+               crypto_service.dart, storage_service.dart, home_screen.dart
+
+==============================================================================
+SEVERITY SUMMARY
+==============================================================================
+
+  CRITICO       14   01 03 06 08 09 11 19 34 35 37 38 39 56 59
+  ALTO           9   07 14 20 29 36 46 48 51 55
+  MEDIO         27   02 04 05 10 12 16 17 18 21 22 23 24 27 28 30 31 33 40 41 42 43 45 47 50 53 54 60
+  BASSO          6   15 25 26 44 52 57
+  INCONSISTENZA  4   13 32 49 58
+
+==============================================================================
+CRITICO (14)
+==============================================================================
+
+Bug-01
+  File:      pam-daemon/bridge_v2.py:808
+  Problema:  ctx.minimum_version = ssl.TLSVersion.TLSv1_2 — accetta TLS 1.2
+  Violazione: Principio 1 (TLS 1.3 obbligatorio)
+  Fix:       ssl.TLSVersion.TLSv1_3
+
+Bug-03
+  File:      pam-daemon/bridge_v2.py:373-376
+  Problema:  openssl genrsa -out key_path 2048 — chiave RSA 2048 per client TLS, non EC
+  Violazione: Principio 1 (architettura specifica EC)
+  Fix:       openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256
+
+Bug-06
+  File:      pam-daemon/bridge_v2.py:400-404
+  Problema:  conversione DER->PEM manuale senza newline ogni 64 char (RFC 7468).
+             base64.b64encode(pub_der).decode() -> blocco PEM su una riga.
+             load_pem_public_key() puo' fallire o produrre chiave errata.
+  Violazione: Principio 3 (Ed25519 public key non correttamente serializzata)
+  Fix:       base64.encodebytes(pub_der).decode() oppure inserire \n ogni 64 char
+
+Bug-08
+  File:      pam-daemon/bridge_v2.py:557-607
+  Problema:  OTP consumato (line 557) PRIMA della verifica attestazione (line 580+).
+             Con enabled=true, un attaccante con OTP valido puo' bruciarlo
+             inviando una catena di attestazione invalida -> DoS provisioning.
+  Violazione: Principio 4 (single-use token consumato in modo non atomico)
+  Fix:       verificare attestazione PRIMA di consume_otp(); rollback se fallisce
+
+Bug-09
+  File:      pam-daemon/bridge_v2.py:676-693
+  Problema:  nonce consumato (line 677) PRIMA della verifica firma Ed25519 (line 690).
+             Un attaccante puo' bruciare un nonce valido con richiesta malformata.
+  Violazione: Principio 4 (replay protection — nonce bruciato senza autenticazione)
+  Fix:       verificare firma Ed25519 PRIMA di check_and_store_nonce()
+
+Bug-11
+  File:      pam-daemon/bridge_v2.py:580-618
+  Problema:  (a) se il client omette attestation_chain del tutto, provisioning riesce
+             anche con enabled=true (line 618: attest_status="no_attestation" senza check).
+             (b) se attestation.py non disponibile e catena presente, verifica saltata.
+  Violazione: Principio 3 (attestazione hardware non applicata come requisito)
+  Fix:       (a) se policy["enabled"]=True e nessuna catena -> rifiutare 403.
+             (b) se _ATTESTATION_AVAILABLE=False e enabled=True -> rifiutare.
+
+Bug-19
+  File:      pam-daemon/attestation.py:282-299
+  Problema:  verify_attestation() non controlla not_valid_before/not_valid_after.
+             Certificati scaduti nella catena passano la verifica.
+  Violazione: Principio 3 (attestazione HW — catena con cert scaduti accettata)
+  Fix:       dopo il parsing dei cert, aggiungere:
+             now = datetime.now(timezone.utc)
+             if cert.not_valid_before_utc > now or cert.not_valid_after_utc < now:
+                 return fail("cert expired or not yet valid")
+
+Bug-34
+  File:      pam-daemon/gui/sys.c:99-104
+  Problema:  sys_systemctl() usa system("systemctl --user %s rofi-bridge ...") — shell
+  Violazione: Principio 5 (no shell — tutto deve essere execv/execvp diretto)
+  Fix:       fork() + execvp() con argv array statico
+
+Bug-35
+  File:      pam-daemon/gui/sys.c:107-114
+  Problema:  sys_port_listening() usa system("ss -tlnp ... | grep -q ...") — shell + pipe
+  Violazione: Principio 5 (no shell)
+  Fix:       aprire /proc/net/tcp direttamente o fare bind test su porta
+
+Bug-37
+  File:      pam-daemon/gui/sys.c:246-260
+  Problema:  sys_list_devices() costruisce cmd openssl con ent->d_name (nome da filesystem)
+             passato a popen(). Nome directory con metacaratteri shell -> command injection.
+  Violazione: Principio 5 (no shell)
+  Fix:       validare d_name come hex puro (^[a-f0-9]+$) prima di usarlo;
+             oppure usare libssl API direttamente senza shell
+
+Bug-38
+  File:      pam-daemon/gui/sys.c:290-296
+  Problema:  sys_revoke_device() usa system("rm -rf '%s'") con device_id nel path.
+             Nome contenente ' -> injection.
+  Violazione: Principio 5 (no shell)
+  Fix:       costruire path completo e usare nftw() o unlinkat() direttamente
+
+Bug-39
+  File:      pam-daemon/gui/sys.c:209
+  Problema:  fprintf(wf, "...\"ca_pass\":\"%s\"}", ca_pass) senza escape JSON.
+             ca_pass con " o \ -> JSON malformato / injection; ca_pass NULL -> crash.
+  Violazione: Principio 3 (CA passphrase corrompibile via JSON injection)
+  Fix:       usare libreria JSON (cJSON, json-c) o escape manuale completo
+
+Bug-56
+  File:      pam_app/android/app/build.gradle:37
+  Problema:  signingConfig = signingConfigs.debug — release APK firmato con debug keys.
+             Debug keys sono pubbliche e note; chiunque puo' sostituire l'APK.
+  Violazione: Principio 3 (integrità applicazione Android)
+  Fix:       generare keystore dedicato; aggiungere signingConfigs.release
+
+Bug-59
+  File:      pam_app/lib/models/config.dart:31
+  Problema:  fallbackEndpoint => 'https://$serverIp:$port' — in hardened mode,
+             serverIp e' l'IP LAN, non 10.0.0.2. Il fallback bypassa WireGuard.
+             http_service.dart usa fallbackEndpoint su timeout/SocketException.
+  Violazione: Principio 7 (WireGuard Layer-0 bypassato silenziosamente)
+  Fix:       in hardened mode, fallbackEndpoint deve essere null o non usato;
+             rimuovere il fallback per hardened mode
+
+==============================================================================
+ALTO (9)
+==============================================================================
+
+Bug-07
+  File:      pam-daemon/bridge_v2.py
+  Problema:  HSLimiter (TLS handshake rate limit) mai attivo perche' untrusted e' sempre
+             False a causa di Bug-26 (config key mismatch). Il rate limit e' disabilitato
+             anche quando untrusted_mode = true in config.toml.
+  Violazione: Principio 1 (DoS TLS handshake non protetto)
+  Fix:       fixare Bug-26 prima
+
+Bug-14
+  File:      pam-daemon/bridge_v2.py:489-496
+  Problema:  _read_body() non ha limite su Content-Length. Content-Length: 2GB ->
+             rfile.read() alloca tutta la memoria -> daemon OOM.
+  Violazione: Principio 1 (disponibilita')
+  Fix:       if length > 65536: return None  prima di rfile.read()
+
+Bug-20
+  File:      pam-daemon/attestation.py:113-130
+  Problema:  _load_roots() rilegge attestation_roots.pem da disco ad ogni chiamata.
+             Race condition: sostituzione file tra provisioning successivi.
+  Violazione: Principio 3 (trust anchors non protetti da sostituzione)
+  Fix:       caricare una volta all'import: _TRUSTED_ROOTS = _load_roots() a livello modulo
+
+Bug-29
+  File:      pam-daemon/relay-setup.sh
+  Problema:  ufw allow 7443/tcp apre porta 7443 sull'interfaccia esterna VPS.
+             Sul VPS non gira nessun servizio su 7443 — regola inutile e fuorviante.
+  Violazione: Principio 7 (superficie di attacco VPS)
+  Fix:       rimuovere la regola; 7443 e' solo dentro WireGuard (sul PC)
+
+Bug-36
+  File:      pam-daemon/gui/sys.c:131-135
+  Problema:  sys_generate_otp() usa popen() per calcolare fingerprint cert via openssl.
+             Shell execution con path da filesystem.
+  Violazione: Principio 5 (no shell)
+  Fix:       leggere cert in memoria e calcolare SHA-256 con OpenSSL API direttamente
+
+Bug-46
+  File:      pam_app/lib/screens/home_screen.dart
+  Problema:  soft-gate: se biometricEnabled=false, usa signPayload() senza biometria.
+             Bypass silenzioso se l'utente non ha attivato la biometria.
+  Violazione: Principio 3 (autenticazione opzionale bypassabile)
+  Fix:       documentare esplicitamente; usare hard-gate per scenari high-security
+
+Bug-48
+  File:      pam_app/android/.../MainActivity.kt:30-37, 279-335
+  Problema:  pendingSignResult, pendingSignAlias, pendingSignData non thread-safe.
+             Rapid double-tap -> race condition -> NPE o doppia completion del Result.
+  Violazione: Principio 3 (integrità flusso firma)
+  Fix:       usare @Volatile o synchronized; annullare prompt precedente prima del nuovo
+
+Bug-51
+  File:      pam-daemon/setup.sh:233
+  Problema:  openssl genrsa -out server.key 2048 — chiave TLS server RSA 2048 anziche' EC.
+             Non rompe forward secrecy (ECDHE e' nel key exchange) ma e' inconsistente.
+  Violazione: Principio 1 (spec richiede EC)
+  Fix:       openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out server.key
+
+Bug-55
+  File:      pam-daemon/setup.sh:259-260
+  Problema:  CA key decrittografata in file temporaneo (mktemp) su disco per tutta la
+             durata della firma server cert. Se il processo viene interrotto, la key
+             plaintext rimane su disco.
+  Violazione: Principio 5 (CA key exposure su disco)
+  Fix:       usare process substitution o pipe per non toccare mai disco con la plaintext key
+
+==============================================================================
+MEDIO (27)
+==============================================================================
+
+Bug-02  bridge_v2.py:812        — cipher string non esclude RSA per TLS 1.2 (irrilevante dopo fix Bug-01)
+Bug-04  bridge_v2.py            — Server header espone versione daemon (fingerprinting)
+Bug-05  bridge_v2.py            — Nessun timeout TCP -> thread leak con client lenti
+Bug-10  bridge_v2.py:224        — sig="no_key" branch logicamente scorretto
+Bug-12  bridge_v2.py:477-478    — Subject CN parsing fragile (ultimo CN vince su duplicati)
+Bug-16  bridge_v2.py            — device_id non validato contro pattern hex prima di usare come path
+Bug-17  bridge_v2.py            — pending_otps.json senza file lock -> race con istanze multiple
+Bug-18  bridge_v2.py            — /audit endpoint restituisce log di tutti i device a qualunque device autenticato
+Bug-21  bridge_v2.py            — device_id in openssl -subj non validato come alnum
+Bug-22  bridge_v2.py            — ca_pass in chiaro in pending_otps.json per 60s
+Bug-23  bridge_v2.py            — base64 padding += "==" incondizionale -> binascii.Error se gia' padded
+Bug-24  bridge_v2.py            — RateLimiter._requests/_failures crescono indefinitamente (memory leak)
+Bug-27  bridge_v2.py            — mDNS annunciato anche in untrusted mode per Bug-26
+Bug-28  bridge_v2.py            — output troncato silenziosamente a 10000 char senza log
+Bug-30  attestation.py          — fallback su DER malformato in _parse_root_of_trust() maschera errori
+Bug-31  ipt-helper.c:26-30      — getenv("HOME") tentato prima di getpwuid (manipolabile in ambienti setcap)
+Bug-33  ipt-helper.c:20         — /usr/sbin/iptables hardcoded, sbagliato su Arch Linux (/usr/bin/iptables)
+Bug-40  sys.c                   — sys_generate_otp() tronca JSON esistente se > 4095 byte
+Bug-41  sys.c:91-92             — strstr("mode")&&strstr("hardened") matcha anche commenti TOML
+Bug-42  sys.c                   — sys_load_config() legge solo port+mode, ignora bind/untrusted/mdns
+Bug-43  sys.c                   — sys_get_ip() fallisce in ambiente WireGuard-only (no route verso 8.8.8.8)
+Bug-45  gui_gtk.c               — timer countdown OTP non cancellato alla chiusura finestra (g_timeout_add leak)
+Bug-47  MainActivity.kt:380     — authResult.cryptoObject!!.signature!! -> NPE su alcuni ROM
+Bug-50  provisioning_screen.dart — _processing flag non thread-safe (doppio scan simultaneo possibile)
+Bug-53  provisioning_screen.dart — addr.substring(0, lastIndexOf(':')) con addr senza ':' -> RangeError
+Bug-54  MainActivity.kt         — certToPem() usa Base64.NO_WRAP senza newline ogni 64 char
+Bug-60  http_service.dart        — fallback endpoint raggiunto anche su errori non-WG in direct mode
+
+==============================================================================
+BASSO (6)
+==============================================================================
+
+Bug-15  bridge_v2.py            — VERSION = "2.1.0" non allineato con versione architetturale (v3.3)
+Bug-25  setup.sh/bridge_v2.py   — setup.sh scrive bind_ip ma bridge_v2.py legge bind (key mismatch)
+Bug-26  setup.sh/bridge_v2.py   — setup.sh scrive untrusted_mode ma bridge_v2.py legge untrusted (key mismatch)
+Bug-44  gui/main.c              — Nessun handler SIGTERM/SIGINT -> risorse GTK non pulite su chiusura brusca
+Bug-52  command.dart            — wireValue non validato contro whitelist daemon al momento build
+Bug-57  relay-setup.sh          — chiave pubblica WireGuard PC non validata (formato 44 char base64)
+
+==============================================================================
+INCONSISTENZA (4)
+==============================================================================
+
+Bug-13  bridge_v2.py:6          — docstring dice "HMAC audit log", implementa Ed25519
+Bug-32  ipt-helper.c/sys.c      — sscanf("port = %d") con spazi multipli: funziona (spazi in format = 0+)
+                                   Originalmente segnalato come bug critico ma e' un falso positivo
+Bug-49  MainActivity.kt         — file fisico in com/example/pam_app/ ma package com.giovanni.pam
+Bug-58  storage_service.dart    — chiavi 'mode' e 'security_mode' semanticamente simili ma diverse
+
+==============================================================================
+I 3 BUG PIU' URGENTI
+==============================================================================
+
+1. Bug-59 (config.dart:31) — fallback in hardened mode bypassa WireGuard -> downgrade Layer-0 silenzioso
+2. Bug-01 (bridge_v2.py:808) — TLS 1.2 accettato -> vanifica Principio 1
+3. Bug-11 (bridge_v2.py:580-618) — attestazione enforcement rotta: enabled=true ignorato senza catena
+
+==============================================================================
+PRINCIPI VIOLATI — RIEPILOGO
+==============================================================================
+
+Principio 1 — TLS 1.3:         PARZIALMENTE VIOLATO (Bug-01, 02, 03, 04, 05, 07, 51)
+Principio 2 — mTLS:            SOSTANZIALMENTE RISPETTATO (Bug-12, 16)
+Principio 3 — Ed25519 Keystore: PARZIALMENTE VIOLATO (Bug-06, 08, 11, 19, 20, 39, 47, 48, 56)
+Principio 4 — Replay:          PARZIALMENTE VIOLATO (Bug-08, 09)
+Principio 5 — Privilege isolat.: PARZIALMENTE VIOLATO (Bug-31, 33, 34, 35, 36, 37, 38, 55)
+Principio 6 — Audit log:       SOSTANZIALMENTE RISPETTATO (Bug-10, 13)
+Principio 7 — WireGuard:       PARZIALMENTE VIOLATO (Bug-29, 59)

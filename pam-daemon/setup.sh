@@ -28,17 +28,19 @@ REGEN_CERT=0
 REGEN_ALL=0
 UNINSTALL=0
 WOL=0
+ENFORCE_ATTEST=0
 
 # ── Argument parsing ──────────────────────────────────────────────────────
 for arg in "$@"; do
     case "$arg" in
-        --hardened)               HARDENED=1   ;;
-        --untrusted-mode)         UNTRUSTED=1  ;;
-        --regenerate-server-cert) REGEN_CERT=1 ;;
-        --regenerate-all)         REGEN_ALL=1  ;;
-        --uninstall)              UNINSTALL=1  ;;
-        --wol)                    WOL=1        ;;
-        --port=*)                 PORT="${arg#*=}" ;;
+        --hardened)               HARDENED=1        ;;
+        --untrusted-mode)         UNTRUSTED=1       ;;
+        --regenerate-server-cert) REGEN_CERT=1      ;;
+        --regenerate-all)         REGEN_ALL=1       ;;
+        --uninstall)              UNINSTALL=1       ;;
+        --wol)                    WOL=1             ;;
+        --enforce-attestation)    ENFORCE_ATTEST=1  ;;
+        --port=*)                 PORT="${arg#*=}"  ;;
         *) die "Unknown argument: $arg" ;;
     esac
 done
@@ -91,35 +93,67 @@ if [ "$UNINSTALL" -eq 1 ]; then
 fi
 
 # ── Prerequisites ─────────────────────────────────────────────────────────
-info "Checking prerequisites..."
-for cmd in openssl gcc systemctl; do
-    command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
-done
-command -v setcap >/dev/null 2>&1 || \
-    die "setcap not found. Install libcap (pacman -S libcap / apt install libcap2-bin)"
+# ── Preflight checks (ALL checks before ANY side effect) ──────────────────
+# Nothing is written or created in this section.
+# If any check fails the script exits without modifying the system.
+info "Running preflight checks..."
+PREFLIGHT_OK=1
 
-# NTP check — C4 fix
+for cmd in openssl gcc systemctl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo -e "${RED}[ERR ]${NC}  Required command not found: $cmd" >&2
+        PREFLIGHT_OK=0
+    fi
+done
+
+if ! command -v setcap >/dev/null 2>&1; then
+    echo -e "${RED}[ERR ]${NC}  setcap not found. Install: pacman -S libcap  or  apt install libcap2-bin" >&2
+    PREFLIGHT_OK=0
+fi
+
+if [ "$HARDENED" -eq 1 ] && ! command -v wg >/dev/null 2>&1; then
+    echo -e "${RED}[ERR ]${NC}  WireGuard tools not found (--hardened requires wg). Install: pacman -S wireguard-tools" >&2
+    PREFLIGHT_OK=0
+fi
+
+if [ ! -f "$IPT_SRC" ]; then
+    echo -e "${RED}[ERR ]${NC}  ipt-helper.c not found at ${IPT_SRC}" >&2
+    PREFLIGHT_OK=0
+fi
+
+# Port validation
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    echo -e "${RED}[ERR ]${NC}  Invalid port: ${PORT} (must be 1-65535)" >&2
+    PREFLIGHT_OK=0
+fi
+
+# LAN IP detection (needed before any mkdir to avoid partial state on failure)
+LAN_IP=$(ip route get 8.8.8.8 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if ($i=="src"){print $(i+1); exit}}')
+if [ -z "$LAN_IP" ]; then
+    echo -e "${RED}[ERR ]${NC}  Could not detect LAN IP. Check network connectivity." >&2
+    PREFLIGHT_OK=0
+fi
+
+# NTP check (warning only — clock drift degrades replay protection, not security-fatal)
 if systemctl is-active --quiet systemd-timesyncd 2>/dev/null || \
    systemctl is-active --quiet chronyd 2>/dev/null; then
     ok "NTP time sync: active"
 else
     warn "NTP (systemd-timesyncd or chronyd) is not active."
-    warn "Timestamp validation requires a synchronised clock (±30s window)."
+    warn "Timestamp validation (±30s) requires a synchronised clock."
     warn "Enable: sudo systemctl enable --now systemd-timesyncd"
 fi
-ok "Prerequisites OK"
+
+[ "$PREFLIGHT_OK" -eq 1 ] || die "Preflight failed — fix the errors above and re-run. Nothing was installed."
+ok "Preflight passed"
+info "Detected LAN IP: ${LAN_IP}"
 
 # ── Directories ───────────────────────────────────────────────────────────
 mkdir -p "${CONFIG_DIR}/clients"
 mkdir -p "${CA_DIR}"
 chmod 700 "${CA_DIR}"
 chmod 700 "${CONFIG_DIR}"
-
-# ── Detect bind IP ────────────────────────────────────────────────────────
-LAN_IP=$(ip route get 8.8.8.8 2>/dev/null \
-    | awk '{for(i=1;i<=NF;i++) if ($i=="src"){print $(i+1); exit}}')
-[ -n "$LAN_IP" ] || die "Could not detect LAN IP. Check network connectivity."
-info "Detected LAN IP: ${LAN_IP}"
 
 if [ "$HARDENED" -eq 1 ]; then
     BIND_IP="10.0.0.2"
@@ -139,9 +173,30 @@ mode           = "${MODE}"
 bind_ip        = "${BIND_IP}"
 untrusted_mode = $([ "$UNTRUSTED" -eq 1 ] && echo "true" || echo "false")
 wol_enabled    = $([ "$WOL" -eq 1 ] && echo "true" || echo "false")
+
+# L-A: Hardware Key Attestation
+# enabled = true  → provisioning without valid attestation chain is rejected
+# enabled = false → attestation is verified and logged but never blocks provisioning
+# Set at install time via: bash setup.sh --enforce-attestation
+[attestation]
+enabled               = $([ "$ENFORCE_ATTEST" -eq 1 ] && echo "true" || echo "false")
+require_hardware_backed = true
+reject_unverified_boot  = true
+require_verified_boot   = false
+require_device_locked   = false
 TOML
     chmod 600 "${CONFIG_DIR}/config.toml"
     ok "config.toml written"
+fi
+
+# ── Attestation root CAs (L-A) ────────────────────────────────────────
+ATTEST_ROOTS_SRC="${SCRIPT_DIR}/attestation_roots.pem"
+if [ -f "${ATTEST_ROOTS_SRC}" ]; then
+    cp "${ATTEST_ROOTS_SRC}" "${CONFIG_DIR}/attestation_roots.pem"
+    chmod 644 "${CONFIG_DIR}/attestation_roots.pem"
+    ok "Attestation roots installed: ${CONFIG_DIR}/attestation_roots.pem"
+else
+    warn "attestation_roots.pem not found at ${ATTEST_ROOTS_SRC} — L-A attestation unavailable"
 fi
 
 # ── CA generation ─────────────────────────────────────────────────────────
@@ -243,7 +298,6 @@ if [ -f "${CA_DIR}/ca.key" ]; then
 fi
 
 # ── Build and install ipt-helper ──────────────────────────────────────────
-[ -f "$IPT_SRC" ] || die "ipt-helper.c not found at ${IPT_SRC}"
 info "Building ipt-helper..."
 gcc -O2 -Wall -o /tmp/pam-ipt-helper "$IPT_SRC" || die "Compilation failed"
 
@@ -350,8 +404,6 @@ fi
 if [ "$HARDENED" -eq 1 ]; then
     echo ""
     info "─── WireGuard setup (hardened mode, PC side) ───────────────────"
-    command -v wg >/dev/null 2>&1 || die "WireGuard not installed. Install: sudo pacman -S wireguard-tools"
-
     PC_PRIV=$(wg genkey)
     PC_PUB=$(echo "${PC_PRIV}" | wg pubkey)
 
@@ -391,6 +443,11 @@ info "  Config:  ${CONFIG_DIR}/"
 info "  CA:      ${CA_DIR}/ca.key.enc"
 info "  Audit:   ${CONFIG_DIR}/audit_sign.key (private) + audit_sign.pub (public)"
 info "  Mode:    ${MODE}, port ${PORT}, bind ${BIND_IP}"
+if [ "$ENFORCE_ATTEST" -eq 1 ]; then
+    ok "  Attestation: ENFORCED (provisioning without valid hardware chain will be rejected)"
+else
+    info "  Attestation: logging only (re-run with --enforce-attestation to enable enforcement)"
+fi
 echo ""
 info "  Start daemon:  systemctl --user start rofi-bridge"
 info "  Enable daemon: systemctl --user enable rofi-bridge"

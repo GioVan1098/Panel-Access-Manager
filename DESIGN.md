@@ -98,13 +98,16 @@ A sudoers `NOPASSWD` entry is a permanent privilege grant tied to the user accou
 
 ### Layer 6 — Audit log
 
-Each completed request appends a JSON line to `audit.log` with a field:
+Each completed request appends a line to `audit.log` in the format:
 
-```json
-{"ts": "...", "device_id": "...", "command": "...", "result": "...", "hmac": "..."}
+```
+{"ts": "...", "device_id": "...", "command": "...", "result": "..."}|<base64_ed25519_sig>
 ```
 
-The `hmac` field is HMAC-SHA256 of the JSON line (excluding the `hmac` field itself) keyed with a server-side `audit_key`. Tampering with a log entry invalidates its HMAC. The key is stored in `config.toml` (chmod 600, not accessible to the daemon's network-facing code path through imports).
+The signature after `|` is an Ed25519 signature over the JSON portion, produced with `audit_sign.key` (private, chmod 400). The corresponding `audit_sign.pub` (public, chmod 444) can be distributed to any party who needs to verify log integrity — without granting them the ability to forge entries.
+
+**Why asymmetric over HMAC-SHA256:**
+HMAC requires sharing the signing key with anyone who needs to verify. On a compromised server, the HMAC key is available to the attacker, who can forge any log entry. With Ed25519, the server holds `audit_sign.key` for signing; verification uses only `audit_sign.pub`. A server compromise gives the attacker the ability to sign future entries but does not enable retroactive forgery of entries already committed — and the public key can be held independently by a monitoring party. The `hmac` module is not imported in the daemon code at all.
 
 ---
 
@@ -156,6 +159,8 @@ The VPS is a dumb relay. It forwards WireGuard UDP packets between peers and not
 
 The daemon binds to the PC's wg0 interface IP (`10.0.0.2`) rather than the LAN IP. The server cert SAN is `IP:10.0.0.2`. This means the cert is useless outside the WireGuard tunnel.
 
+**Per-peer pre-shared key (PSK)**: `relay-setup.sh` generates a 256-bit PSK per peer (`wg genpsk`) and adds a `PresharedKey` line to each `[Peer]` block in `wg0.conf`. The PSK is mixed into the Noise_IKpsk2 handshake as an additional symmetric secret. If the static Curve25519 keys are ever broken (e.g., by a quantum adversary), the PSK provides a second layer: an attacker must obtain both the long-term private key AND the PSK to decrypt session traffic. The PSK does not affect tunnel performance — it is consumed during the handshake, not per-packet.
+
 **Why not a VPN to home router instead?**
 A router-based VPN (OpenVPN, WireGuard on router) gives the phone full LAN access. PAM-hardened gives the phone access only to `10.0.0.2:7443` — the single PAM port. Even within the WireGuard tunnel, all six authentication layers still apply.
 
@@ -184,32 +189,35 @@ Netflix adds Widevine L1 DRM on top (for encrypted video bytes in the decoder pi
 
 The flag is applied at the Activity level, covering all screens (home, provisioning, settings). This avoids gaps that could arise from applying protection only to specific screens and leaving transitions unprotected.
 
-### Biometric authentication gate
+### Biometric authentication gate — two modes
 
-The app supports an optional per-command biometric confirmation, configurable in Settings. The implementation uses `BiometricPrompt` from the `androidx.biometric` library with `FlutterFragmentActivity` as the Activity base class (required by BiometricPrompt's Fragment-based API).
+The app supports two biometric modes, selected once at provisioning time. The choice is baked into the Android Keystore key flags and stored in `flutter_secure_storage` as `security_mode`.
 
-**Why soft-gate over CryptoObject hard-gate:**
+#### Soft-gate (standard mode)
 
-Two modes exist for BiometricPrompt:
+The key is generated without auth requirements. `BiometricPrompt` gates the `sign()` call at the application level — if authentication succeeds, the app calls `sign()`; if cancelled, it does not. This is an application-level check in the app process, not a TEE-level lock.
 
-1. **Hard-gate (CryptoObject)**: the Ed25519 key is generated with `setUserAuthenticationRequired(true)`. The key is cryptographically locked inside the TEE until a biometric match is confirmed by the TEE itself. This is the most secure option, but it requires regenerating the key — and therefore re-provisioning the device — every time the option is toggled. It also makes the key permanently inaccessible if the biometric sensor is temporarily unavailable.
+Authenticators: `BIOMETRIC_STRONG | DEVICE_CREDENTIAL`. Can be toggled in Settings at any time without re-provisioning. Correct for the primary threat model (unauthorized access on an unlocked phone on a non-rooted device).
 
-2. **Soft-gate (no CryptoObject)**: BiometricPrompt gates the `sign()` call at the application level. If authentication succeeds, the app proceeds to sign; if it fails or is cancelled, the app does not. The block is software-level in the app process, not hardware-level in the TEE.
+#### Hard-gate (hardened mode)
 
-PAM uses soft-gate because the biometric option must be configurable at runtime without re-provisioning. A user who provisioned without biometric enabled should be able to enable it later without repeating the full provisioning flow. The security guarantees are equivalent for the target scenario (unauthorized access on an unlocked phone) on a non-rooted device.
+The key is generated with `setUserAuthenticationRequired(true)`, `setUserAuthenticationValidityDurationSeconds(-1)` (per-use, not time-window), and `setInvalidatedByBiometricEnrollment(true)`. Signing is done via `CryptoObject`: a `Signature` object initialized with the private key is passed into `BiometricPrompt.authenticate()`. The TEE performs the actual signing inside `onAuthenticationSucceeded()` via `authResult.cryptoObject!!.signature!!`. The key physically cannot sign without a fresh biometric match inside the secure element.
 
-**Authenticator configuration:**
+Only `BIOMETRIC_STRONG` is accepted — Android API prohibits `DEVICE_CREDENTIAL` with `CryptoObject`. Cannot be toggled at runtime. Changing mode requires deleting the existing key and re-provisioning with the new flags. If the user adds or removes biometric enrollment, the key is invalidated.
 
-```kotlin
-BiometricManager.Authenticators.BIOMETRIC_STRONG or
-BiometricManager.Authenticators.DEVICE_CREDENTIAL
-```
+**Security mode selection at provisioning:**
 
-This is the recommended configuration for high-security apps: BIOMETRIC\_STRONG is preferred (hardware-backed fingerprint, 3D face), with automatic fallback to PIN/password if biometric is unavailable or enrolled biometrics fail. The app queries `BiometricManager.canAuthenticate()` before offering the option in Settings, and shows descriptive messages for each unavailability reason (NO\_HARDWARE, HW\_UNAVAILABLE, NONE\_ENROLLED, SECURITY\_UPDATE\_REQUIRED).
+A modal dialog (non-dismissible) is shown before key generation. The choice is stored and reflected in the Settings screen as a read-only tile. The deprovision flow (`deleteKey(deviceId)` before `clearAll()`) ensures the key alias is available for deletion before `flutter_secure_storage` is wiped.
 
 **Async MethodChannel result:**
 
-BiometricPrompt callbacks are asynchronous. The MethodChannel `Result` for `signWithBiometric` is stored in instance fields (`pendingSignResult`, `pendingSignAlias`, `pendingSignData`) and completed in `onAuthenticationSucceeded()`. The `return@setMethodCallHandler` guard prevents the outer try-catch from resolving the Result prematurely. `BIOMETRIC_CANCELLED` errors are handled silently on the Dart side (no red error shown for intentional cancellation).
+BiometricPrompt callbacks are asynchronous. For soft-gate: `pendingSignResult`, `pendingSignAlias`, `pendingSignData`. For hard-gate: `pendingHardGateResult`, `pendingHardGateData`. Both completed in `onAuthenticationSucceeded()`. The `return@setMethodCallHandler` guard prevents the outer try-catch from resolving the Result prematurely. `BIOMETRIC_CANCELLED` is handled silently on the Dart side.
+
+### Wake-on-LAN
+
+When enabled (Settings toggle + MAC address, or pre-configured by `setup.sh --wol`), the app sends a 102-byte UDP magic packet (6×0xFF + target MAC×16, port 9) before each command and waits 3 seconds. PAM direct uses broadcast `255.255.255.255`; PAM-hardened uses unicast to `10.0.0.2` through the WireGuard tunnel.
+
+This addresses the PC-sleep scenario: commands sent to a sleeping PC silently fail because the WireGuard tunnel is down. WoL wakes the PC from light sleep before the command arrives. For deep sleep (S5) over PAM-hardened, the tunnel NIC is offline and cannot receive the routed unicast — BIOS-level WoL on the LAN interface is required in that case.
 
 ### Device integrity check
 
@@ -256,15 +264,18 @@ A temporary key is generated only for the probe and immediately deleted. The che
 
 The approach is non-blocking: an informed user (e.g., one who uses Magisk deliberately) can choose to continue.
 
-**Limitation of the current implementation:**
+**Full hardware attestation (L-A):**
 
-The current check uses `KeyInfo.securityLevel` without a full attestation challenge. A full attestation would require:
-1. Server generates a nonce
-2. Client passes it as `setAttestationChallenge(nonce)` at key generation
-3. Client sends the resulting certificate chain to the server
-4. Server verifies the chain up to the Google device attestation root and reads `verifiedBootState` / `bootloaderLocked` from the ASN.1 extension (OID 1.3.6.1.4.1.11129.2.1.17)
+Full Android Key Attestation is implemented as an optional layer on top of `checkDeviceIntegrity()`. It triggers automatically at first provisioning whenever a new key must be generated:
 
-This would distinguish a stock non-rooted device (VERIFIED) from one with unlocked bootloader more reliably than Build.TAGS. It is not implemented in the current version due to the ASN.1 parsing complexity and the server-side PKI changes required. Documented as a future extension.
+1. Before key generation, the app fetches a one-time challenge via GET `/provision/challenge`. The server generates a 32-byte random nonce (TTL 120 seconds, one-time use), returns it base64-encoded, and stores it in a thread-safe in-memory map with expiry.
+2. The nonce is passed to `KeyGenParameterSpec.Builder.setAttestationChallenge(nonce)` at Ed25519 key generation. Android embeds the raw nonce inside the leaf certificate of the resulting attestation chain. The chain is retrieved via `KeyStore.getCertificateChain(alias)`, leaf first.
+3. The PEM-encoded certificate chain and the original base64 challenge are sent alongside the Ed25519 public key in POST `/provision` as `attestation_chain` and `attestation_challenge`.
+4. The server calls `attestation.py: verify_attestation()`. The function verifies each certificate signature in the chain (leaf → root), then checks that the root fingerprint matches a trusted anchor from `attestation_roots.pem` — the Google Hardware Attestation Root CA bundle (two roots: RSA-4096 valid 2022–2042 and EC P-384 "Key Attestation CA1" valid 2025–2035). No external ASN.1 library is required — a custom DER TLV parser (BER/DER-compliant, handles long-form tags such as rootOfTrust tag 704 = `BF 85 40`) operates on the raw extension bytes.
+5. The `KeyDescription` extension (OID `1.3.6.1.4.1.11129.2.1.17`) is parsed positionally: `attestationSecurityLevel` at index 1, `attestationChallenge` (OCTET STRING) at index 4 is compared against the server-issued nonce to confirm the key was generated specifically for this provisioning session, and `teeEnforced[7] → rootOfTrust[704]` yields `verifiedBootState` and `deviceLocked`.
+6. Policy is configurable in `config.toml` under `[attestation]`: `require_hardware_backed` (default `true`), `reject_unverified_boot` (default `true`), `require_verified_boot` (default `false`), `require_device_locked` (default `false`).
+
+Attestation is **best-effort and non-blocking by default**: if the challenge fetch fails, the app silently falls back to standard key generation and provisioning proceeds without attestation. Re-provisioning with an existing key of the same security mode skips attestation entirely — a key generated without an embedded challenge cannot be attested retroactively. The server ships with `enabled = false`; attestation results are recorded in the audit log entry for the provisioning event, but do not reject provisioning unless the operator enables enforcement in `config.toml`.
 
 ---
 
@@ -287,7 +298,9 @@ The private key never leaves the Keystore. Signing is performed inside the secur
 
 The public key is exported as DER-encoded X.509 SubjectPublicKeyInfo, wrapped in PEM (`BEGIN PUBLIC KEY` / `END PUBLIC KEY`). Python's `cryptography` library reads it with `load_pem_public_key()` and verifies with `pub.verify(sig_bytes, payload_bytes)`.
 
-Android Keystore keys are not included in Android backups. Phone loss means re-provisioning (generate new keypair, new client cert). The lost device is revoked from the GUI (`clients/<device_id>/` deleted, serial appended to `revoked.txt`), and the daemon restarted. Re-provisioning takes under two minutes.
+Android Keystore keys are not included in Android backups. `android:allowBackup="false"` in `AndroidManifest.xml` additionally excludes all app data (including `flutter_secure_storage` TLS keys) from cloud and local backups. Phone loss means re-provisioning (generate new keypair, new client cert). The lost device is revoked from the GUI (`clients/<device_id>/` deleted, serial appended to `revoked.txt`), and the daemon restarted. Re-provisioning takes under two minutes.
+
+**Deprovision order**: when deprovisioning from Settings, `deleteKey(deviceId)` must be called before `_storage.clearAll()`. The `device_id` (used as the Keystore key alias) is stored in `flutter_secure_storage`; calling `clearAll()` first would wipe the alias, making the Keystore key orphaned and uncleanable.
 
 ---
 
@@ -295,8 +308,9 @@ Android Keystore keys are not included in Android backups. Phone loss means re-p
 
 | # | Limitation | Impact | Mitigation |
 |---|---|---|---|
+| R3 | ~~Android backup TLS key recovery~~ | ~~Resolved~~ | `android:allowBackup="false"` — app excluded from all backups (L-B, v3.2) |
 | R7 | NTP drift or misconfigured clock | Timestamp validation fails, legitimate requests rejected | `setup.sh` checks for active timesyncd/chronyd |
-| R8 | PC sleep breaks WireGuard keepalive | Commands in 25s window silently dropped | Health check before command; Wake-on-LAN as complement |
+| R8 | PC sleep breaks WireGuard keepalive | Commands to sleeping PC silently fail | Wake-on-LAN now implemented (L-E, v3.2): magic packet sent before each command; deep sleep over WG tunnel still unsolved |
 | R9 | Ed25519 keys non-exportable from Keystore | Phone loss requires re-provisioning | Revoke from GUI, re-provision in ~2 minutes |
 | R10 | Physical server compromise | Attacker gets `server.key`, `ca.crt`, client public keys | Forward secrecy protects past traffic; CA offline limits damage |
 | R11 | TEE-less device (securityLevel = SOFTWARE) | Ed25519 key stored in process memory, extractable with root | `checkDeviceIntegrity()` warns at provisioning; user can abort; five other layers remain intact |
@@ -315,5 +329,7 @@ None of these are considered blocking for the target use case (single trusted de
 | Keystore bridge | Kotlin MethodChannel | Direct AndroidKeyStore access; no third-party crypto library |
 | Privilege helper | C + setcap | Minimal binary; capability tied to inode, not user account |
 | Nonce store | SQLite | Persistent across restarts; single-file, no daemon required |
+| Audit signing | Ed25519 (`audit_sign.key`/`audit_sign.pub`) | Asymmetric: sign with private key, verify with public key independently |
+| Key attestation | `attestation.py` + `attestation_roots.pem` | Custom DER TLV parser; `cryptography` library only (no pyasn1); Google Hardware Attestation Root CA bundle |
 | CA | openssl CLI | Transparent, auditable; no custom PKI library |
 | Overlay (hardened) | WireGuard (kernel) | ~4k LOC, formally verified Noise protocol, kernel-native performance |

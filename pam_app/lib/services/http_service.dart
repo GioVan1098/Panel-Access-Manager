@@ -181,6 +181,31 @@ class HttpService {
     }
   }
 
+  /// Fetch a one-time attestation challenge from the server (GET /provision/challenge).
+  /// Returns the challenge as a base64 string. Must be called before key generation
+  /// so the challenge can be passed to [generateKeyPairWithAttestation].
+  Future<String> getAttestationChallenge({
+    required String serverIp,
+    required int port,
+    required String fingerprintHex,
+  }) async {
+    final client = _buildTofuClient(fingerprintHex);
+    try {
+      final req = await client
+          .getUrl(Uri.parse('https://$serverIp:$port/provision/challenge'))
+          .timeout(const Duration(seconds: 10));
+      final resp = await req.close().timeout(const Duration(seconds: 10));
+      final body = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode != 200) {
+        throw Exception('Challenge fetch failed: HTTP ${resp.statusCode}');
+      }
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      return json['challenge'] as String;
+    } finally {
+      client.close();
+    }
+  }
+
   Future<ProvisioningResult> provision({
     required String serverIp,
     required int port,
@@ -188,6 +213,8 @@ class HttpService {
     required String otp,
     required String deviceId,
     required String ed25519PubKeyB64,
+    List<String>? attestationChain,
+    String? attestationChallenge,
   }) async {
     final client = _buildTofuClient(fingerprintHex);
     try {
@@ -195,14 +222,18 @@ class HttpService {
           .postUrl(Uri.parse('https://$serverIp:$port/provision'))
           .timeout(const Duration(seconds: 15));
       req.headers.contentType = ContentType.json;
-      req.write(jsonEncode({
+      final body = <String, dynamic>{
         'otp': otp,
         'device_id': deviceId,
         'ed25519_pubkey': ed25519PubKeyB64,
-      }));
+      };
+      if (attestationChain != null && attestationChallenge != null) {
+        body['attestation_chain']     = attestationChain;
+        body['attestation_challenge'] = attestationChallenge;
+      }
+      req.write(jsonEncode(body));
       final resp = await req.close().timeout(const Duration(seconds: 15));
-      final respBody =
-          await resp.transform(utf8.decoder).join();
+      final respBody = await resp.transform(utf8.decoder).join();
 
       if (resp.statusCode != 200) {
         throw Exception('Provisioning failed: HTTP ${resp.statusCode} — $respBody');

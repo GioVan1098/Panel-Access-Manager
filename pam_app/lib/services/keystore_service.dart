@@ -24,6 +24,43 @@ class KeystoreService {
     return pubKey!;
   }
 
+  /// Generate a key pair with hardware attestation (standard security mode).
+  /// Returns a Map with "pub_key" (base64 String) and "chain" (List<String> PEM certs,
+  /// leaf first). [challengeB64] must be obtained from GET /provision/challenge.
+  Future<Map<String, dynamic>> generateKeyPairWithAttestation(
+    String alias,
+    String challengeB64,
+  ) async {
+    final result = await _channel.invokeMethod<Map>(
+      'generateKeyPairWithAttestation',
+      {'alias': alias, 'challengeB64': challengeB64},
+    );
+    final m = Map<String, dynamic>.from(result ?? {});
+    // chain comes back as List<Object?> — cast to List<String>
+    if (m['chain'] is List) {
+      m['chain'] = List<String>.from(m['chain'] as List);
+    }
+    return m;
+  }
+
+  /// Generate a key pair with hardware attestation (hardened / hard-gate mode).
+  /// Same as [generateKeyPairWithAttestation] but with TEE-level biometric
+  /// enforcement baked into the key (setUserAuthenticationRequired=true).
+  Future<Map<String, dynamic>> generateKeyPairHardenedWithAttestation(
+    String alias,
+    String challengeB64,
+  ) async {
+    final result = await _channel.invokeMethod<Map>(
+      'generateKeyPairHardenedWithAttestation',
+      {'alias': alias, 'challengeB64': challengeB64},
+    );
+    final m = Map<String, dynamic>.from(result ?? {});
+    if (m['chain'] is List) {
+      m['chain'] = List<String>.from(m['chain'] as List);
+    }
+    return m;
+  }
+
   Future<String> sign(String alias, Uint8List data) async {
     final sig = await _channel.invokeMethod<String>(
       'sign',

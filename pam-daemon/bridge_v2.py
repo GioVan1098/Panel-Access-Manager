@@ -39,7 +39,14 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
+try:
+    from attestation import verify_attestation, AttestationResult
+    _ATTESTATION_AVAILABLE = True
+except ImportError:
+    _ATTESTATION_AVAILABLE = False
+
 # ── Paths ──────────────────────────────────────────────────────────────
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 HOME         = os.path.expanduser("~")
 CONFIG_DIR   = os.path.join(HOME, ".config", "rofi-bridge")
 CONFIG_FILE  = os.path.join(CONFIG_DIR, "config.toml")
@@ -55,9 +62,10 @@ CLIENTS_DIR  = os.path.join(CONFIG_DIR, "clients")
 REVOKED_FILE = os.path.join(CONFIG_DIR, "revoked.txt")
 IPT_HELPER   = "/usr/lib/rofi-bridge/ipt-helper"
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ── Constants ──────────────────────────────────────────────────────────
+CHALLENGE_TTL    = 120   # seconds: attestation challenge expiry
 TIMESTAMP_WINDOW = 30    # seconds: replay window
 NONCE_TTL        = 300   # seconds: nonce expiry
 RATE_LIMIT_REQ   = 10    # requests per window
@@ -86,6 +94,44 @@ COMMANDS: dict[str, list[str]] = {
     "daemon_stop":     ["systemctl", "--user", "stop",       "rofi-bridge"],
     "daemon_restart":  ["systemctl", "--user", "restart",    "rofi-bridge"],
 }
+
+
+# ── Attestation challenge store (in-memory, TTL = CHALLENGE_TTL) ───────
+# Maps base64-challenge → expiry timestamp (float).
+# Challenges are single-use: consumed when the client calls /provision.
+_challenge_store: dict = {}
+_challenge_lock = threading.Lock()
+
+
+def _challenge_store_cleanup() -> None:
+    """Remove expired challenges (called inline, no dedicated thread needed)."""
+    now = time.time()
+    expired = [k for k, exp in _challenge_store.items() if exp < now]
+    for k in expired:
+        del _challenge_store[k]
+
+
+def issue_challenge() -> str:
+    """Generate a fresh attestation challenge, store it, return base64 string."""
+    raw = secrets.token_bytes(32)
+    b64 = base64.b64encode(raw).decode()
+    with _challenge_lock:
+        _challenge_store_cleanup()
+        _challenge_store[b64] = time.time() + CHALLENGE_TTL
+    return b64
+
+
+def consume_challenge(b64: str) -> Optional[bytes]:
+    """Consume challenge if valid and not expired. Returns raw bytes or None."""
+    with _challenge_lock:
+        exp = _challenge_store.get(b64)
+        if exp is None or exp < time.time():
+            return None
+        del _challenge_store[b64]
+    try:
+        return base64.b64decode(b64)
+    except Exception:
+        return None
 
 
 # ── Config ─────────────────────────────────────────────────────────────
@@ -381,6 +427,29 @@ def execute_command(cmd: str) -> tuple[int, str]:
         return 1, str(e)
 
 
+# ── Attestation policy (read from config [attestation] section) ────────
+def _attestation_policy() -> dict:
+    """Return the attestation policy dict from config, with safe defaults."""
+    try:
+        cfg = load_config()
+        raw = cfg.get("attestation", {})
+        return {
+            "enabled":               bool(raw.get("enabled",               False)),
+            "require_hardware_backed": bool(raw.get("require_hardware_backed", True)),
+            "reject_unverified_boot":  bool(raw.get("reject_unverified_boot",  True)),
+            "require_verified_boot":   bool(raw.get("require_verified_boot",   False)),
+            "require_device_locked":   bool(raw.get("require_device_locked",   False)),
+        }
+    except Exception:
+        return {
+            "enabled": False,
+            "require_hardware_backed": True,
+            "reject_unverified_boot":  True,
+            "require_verified_boot":   False,
+            "require_device_locked":   False,
+        }
+
+
 # ── HTTP request handler ───────────────────────────────────────────────
 class PAMHandler(http.server.BaseHTTPRequestHandler):
     server_version = f"PAM/{VERSION}"
@@ -430,6 +499,8 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._h_health()
+        elif self.path == "/provision/challenge":
+            self._h_provision_challenge()
         elif self.path.startswith("/audit"):
             self._h_audit()
         else:
@@ -446,6 +517,17 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
     # ── /health ────────────────────────────────────────────────────────
     def _h_health(self):
         self._send_json(200, {"status": "ok", "version": VERSION})
+
+    # ── /provision/challenge ───────────────────────────────────────────
+    def _h_provision_challenge(self):
+        """Issue a one-time 32-byte challenge for key attestation.
+        The client must pass the returned challenge as attestation_challenge
+        in setAttestationChallenge() during key generation, then include
+        the resulting cert chain in POST /provision.
+        Challenge is valid for CHALLENGE_TTL seconds and single-use.
+        """
+        b64 = issue_challenge()
+        self._send_json(200, {"challenge": b64})
 
     # ── /audit ─────────────────────────────────────────────────────────
     def _h_audit(self):
@@ -491,6 +573,50 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400, "Invalid ed25519_pubkey encoding")
             return
 
+        # ── L-A: Optional attestation chain verification ────────────
+        attestation_chain     = body.get("attestation_chain")      # list[str] | None
+        attestation_challenge = body.get("attestation_challenge")  # base64 str | None
+
+        if attestation_chain is not None:
+            # If chain is present, challenge must be too and must still be valid
+            if not attestation_challenge:
+                self.send_error(400, "attestation_chain requires attestation_challenge")
+                audit(device_id, "provision", "attest_missing_challenge", "")
+                return
+
+            raw_challenge = consume_challenge(attestation_challenge)
+            if raw_challenge is None:
+                self.send_error(400, "attestation_challenge invalid or expired")
+                audit(device_id, "provision", "attest_challenge_expired", "")
+                return
+
+            if not _ATTESTATION_AVAILABLE:
+                logging.warning(
+                    "attestation.py not available — skipping chain verification"
+                )
+                attest_status = "attest_module_unavailable"
+            else:
+                policy = _attestation_policy()
+                result = verify_attestation(attestation_chain, raw_challenge, policy)
+                if not result.ok:
+                    logging.warning(
+                        "Attestation failed for %s: %s", device_id, result.reason
+                    )
+                    self.send_error(403, f"Attestation failed: {result.reason}")
+                    audit(device_id, "provision", f"attest_fail:{result.reason}", "")
+                    return
+                attest_status = (
+                    f"attest_ok:sl={result.attestation_security_level}"
+                    f",vbs={result.verified_boot_state}"
+                )
+                logging.info(
+                    "Attestation OK for %s — security_level=%d, boot_state=%d",
+                    device_id, result.attestation_security_level,
+                    result.verified_boot_state,
+                )
+        else:
+            attest_status = "no_attestation"
+
         try:
             certs = provision_client(device_id, ed25519_pubkey, ca_pass)
         except subprocess.CalledProcessError as e:
@@ -499,7 +625,7 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
             audit(device_id, "provision", "cert_error", "")
             return
 
-        audit(device_id, "provision", "ok", "")
+        audit(device_id, "provision", f"ok:{attest_status}", "")
         self._send_json(200, {
             "ca_crt":  certs["ca_crt"],
             "tls_crt": certs["tls_crt"],

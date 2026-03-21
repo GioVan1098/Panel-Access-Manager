@@ -19,6 +19,7 @@ import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.Signature
+import java.security.cert.Certificate
 import java.security.spec.ECGenParameterSpec
 
 class MainActivity : FlutterFragmentActivity() {
@@ -53,6 +54,16 @@ class MainActivity : FlutterFragmentActivity() {
                         "generateKeyPairHardened" -> {
                             val alias = call.argument<String>("alias")!!
                             result.success(generateKeyPairHardened(alias))
+                        }
+                        "generateKeyPairWithAttestation" -> {
+                            val alias       = call.argument<String>("alias")!!
+                            val challengeB64 = call.argument<String>("challengeB64")!!
+                            result.success(generateKeyPairWithAttestation(alias, challengeB64))
+                        }
+                        "generateKeyPairHardenedWithAttestation" -> {
+                            val alias       = call.argument<String>("alias")!!
+                            val challengeB64 = call.argument<String>("challengeB64")!!
+                            result.success(generateKeyPairHardenedWithAttestation(alias, challengeB64))
                         }
                         "sign" -> {
                             val alias = call.argument<String>("alias")!!
@@ -157,6 +168,95 @@ class MainActivity : FlutterFragmentActivity() {
         }
 
         return Base64.encodeToString(keyPair.public.encoded, Base64.NO_WRAP)
+    }
+
+    /**
+     * Generate a key pair with hardware attestation (standard security mode).
+     * Identical to [generateKeyPair] but passes the attestation challenge so
+     * the TEE embeds a KeyDescription extension in the leaf certificate.
+     *
+     * Returns a Map with:
+     *   "pub_key" : String  — base64 public key (X.509 SubjectPublicKeyInfo DER)
+     *   "chain"   : List<String> — PEM certificate chain, leaf first (index 0)
+     */
+    private fun generateKeyPairWithAttestation(
+        alias: String,
+        challengeB64: String
+    ): Map<String, Any> {
+        val challenge = Base64.decode(challengeB64, Base64.NO_WRAP)
+        val kpg = KeyPairGenerator.getInstance("Ed25519", "AndroidKeyStore")
+
+        fun buildSpec(strongBox: Boolean): KeyGenParameterSpec {
+            val b = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                .setAttestationChallenge(challenge)
+            if (strongBox) b.setIsStrongBoxBacked(true)
+            return b.build()
+        }
+
+        val keyPair = try {
+            kpg.initialize(buildSpec(strongBox = true))
+            kpg.generateKeyPair()
+        } catch (e: StrongBoxUnavailableException) {
+            kpg.initialize(buildSpec(strongBox = false))
+            kpg.generateKeyPair()
+        }
+
+        val ks = KeyStore.getInstance("AndroidKeyStore").also { it.load(null) }
+        val chain = ks.getCertificateChain(alias)?.map { certToPem(it) } ?: emptyList<String>()
+
+        return mapOf(
+            "pub_key" to Base64.encodeToString(keyPair.public.encoded, Base64.NO_WRAP),
+            "chain"   to chain
+        )
+    }
+
+    /**
+     * Generate a key pair with hardware attestation (hardened / hard-gate security mode).
+     * Combines [generateKeyPairHardened] TEE-level biometric enforcement with
+     * [generateKeyPairWithAttestation] attestation chain generation.
+     *
+     * Returns a Map with:
+     *   "pub_key" : String  — base64 public key
+     *   "chain"   : List<String> — PEM certificate chain, leaf first
+     */
+    private fun generateKeyPairHardenedWithAttestation(
+        alias: String,
+        challengeB64: String
+    ): Map<String, Any> {
+        val challenge = Base64.decode(challengeB64, Base64.NO_WRAP)
+        val kpg = KeyPairGenerator.getInstance("Ed25519", "AndroidKeyStore")
+
+        fun buildSpec(strongBox: Boolean): KeyGenParameterSpec {
+            val b = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                .setAttestationChallenge(challenge)
+                .setUserAuthenticationRequired(true)
+                .setUserAuthenticationValidityDurationSeconds(-1)
+                .setInvalidatedByBiometricEnrollment(true)
+            if (strongBox) b.setIsStrongBoxBacked(true)
+            return b.build()
+        }
+
+        val keyPair = try {
+            kpg.initialize(buildSpec(strongBox = true))
+            kpg.generateKeyPair()
+        } catch (e: StrongBoxUnavailableException) {
+            kpg.initialize(buildSpec(strongBox = false))
+            kpg.generateKeyPair()
+        }
+
+        val ks = KeyStore.getInstance("AndroidKeyStore").also { it.load(null) }
+        val chain = ks.getCertificateChain(alias)?.map { certToPem(it) } ?: emptyList<String>()
+
+        return mapOf(
+            "pub_key" to Base64.encodeToString(keyPair.public.encoded, Base64.NO_WRAP),
+            "chain"   to chain
+        )
+    }
+
+    /** Encode a java.security.cert.Certificate as a PEM string. */
+    private fun certToPem(cert: Certificate): String {
+        val b64 = Base64.encodeToString(cert.encoded, Base64.NO_WRAP)
+        return "-----BEGIN CERTIFICATE-----\n$b64\n-----END CERTIFICATE-----"
     }
 
     // ── Signing ──────────────────────────────────────────────────────────

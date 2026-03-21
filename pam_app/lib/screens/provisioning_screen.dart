@@ -126,26 +126,57 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
         await _storage.setSecurityMode(securityMode);
       }
 
-      // ── Key generation (mode-aware) ────────────────────────────────────
+      // ── Key generation (mode-aware, with optional L-A attestation) ────
+      // Attestation is only possible when generating a NEW key — the challenge
+      // is embedded at key generation time via setAttestationChallenge().
+      // Re-provisioning with an existing key (same mode) skips attestation.
       final bool keyExists = await _keystore.hasKey(deviceId);
-      final String ed25519PubKey;
+      final bool modeChanged = existingMode != null && existingMode != securityMode;
+      final bool needNewKey = !keyExists || modeChanged;
 
-      if (keyExists) {
-        // If the security mode changed (re-provisioning with different mode),
-        // delete the old key so the new one is generated with the correct flags.
-        if (existingMode != null && existingMode != securityMode) {
+      final String ed25519PubKey;
+      List<String>? attestationChain;
+      String? challengeB64;
+
+      if (needNewKey) {
+        if (modeChanged) {
           await _keystore.deleteKey(deviceId);
           await _storage.setSecurityMode(securityMode);
+        }
+
+        // Try to fetch an attestation challenge (best-effort; non-blocking on failure)
+        try {
+          challengeB64 = await _http.getAttestationChallenge(
+            serverIp: serverIp,
+            port: port,
+            fingerprintHex: fp,
+          );
+        } catch (_) {
+          challengeB64 = null;
+        }
+
+        if (challengeB64 != null) {
+          // Generate key with attestation chain
+          final keyResult = securityMode == 'hardened'
+              ? await _keystore.generateKeyPairHardenedWithAttestation(
+                  deviceId, challengeB64)
+              : await _keystore.generateKeyPairWithAttestation(
+                  deviceId, challengeB64);
+          ed25519PubKey = keyResult['pub_key'] as String;
+          final raw = keyResult['chain'];
+          attestationChain = raw is List ? List<String>.from(raw) : null;
+        } else {
+          // Attestation unavailable — fall back to standard key generation
           ed25519PubKey = securityMode == 'hardened'
               ? await _keystore.generateKeyPairHardened(deviceId)
               : await _keystore.generateKeyPair(deviceId);
-        } else {
-          ed25519PubKey = await _keystore.getPublicKey(deviceId);
+          attestationChain = null;
         }
       } else {
-        ed25519PubKey = securityMode == 'hardened'
-            ? await _keystore.generateKeyPairHardened(deviceId)
-            : await _keystore.generateKeyPair(deviceId);
+        // Re-provisioning with existing key and same mode — no attestation
+        ed25519PubKey = await _keystore.getPublicKey(deviceId);
+        attestationChain = null;
+        challengeB64 = null;
       }
 
       final result = await _http.provision(
@@ -155,6 +186,8 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
         otp: otp,
         deviceId: deviceId,
         ed25519PubKeyB64: ed25519PubKey,
+        attestationChain: attestationChain,
+        attestationChallenge: challengeB64,
       );
 
       await _storage.setCaCert(result.caCertPem);
