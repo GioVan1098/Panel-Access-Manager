@@ -277,6 +277,10 @@ class MainActivity : FlutterFragmentActivity() {
      * - Completes [result] asynchronously
      */
     private fun signWithBiometric(alias: String, data: ByteArray, result: MethodChannel.Result) {
+        if (pendingSignResult != null) {
+            result.error("SIGN_BUSY", "A biometric authentication is already in progress", null)
+            return
+        }
         pendingSignResult = result
         pendingSignAlias = alias
         pendingSignData = data
@@ -348,6 +352,10 @@ class MainActivity : FlutterFragmentActivity() {
         data: ByteArray,
         result: MethodChannel.Result
     ) {
+        if (pendingHardGateResult != null) {
+            result.error("SIGN_BUSY", "A biometric authentication is already in progress", null)
+            return
+        }
         val ks = KeyStore.getInstance("AndroidKeyStore").also { it.load(null) }
         val privateKey = ks.getKey(alias, null) as PrivateKey
         val sig = Signature.getInstance("Ed25519")
@@ -376,8 +384,12 @@ class MainActivity : FlutterFragmentActivity() {
                     val pData   = pendingHardGateData   ?: return
                     pendingHardGateResult = null
                     pendingHardGateData   = null
+                    val s = authResult.cryptoObject?.signature
+                    if (s == null) {
+                        pResult.error("SIGN_ERROR", "CryptoObject.signature is null", null)
+                        return
+                    }
                     try {
-                        val s = authResult.cryptoObject!!.signature!!
                         s.update(pData)
                         pResult.success(Base64.encodeToString(s.sign(), Base64.NO_WRAP))
                     } catch (e: Exception) {

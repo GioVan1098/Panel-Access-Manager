@@ -68,24 +68,8 @@ class HttpService {
         tlsKeyBytes: tlsKeyBytes,
       );
     } on TimeoutException {
-      if (config.mode == PamMode.hardened) {
-        return _doHealthCheck(
-          config.fallbackEndpoint,
-          caCertBytes: caCertBytes,
-          tlsCertBytes: tlsCertBytes,
-          tlsKeyBytes: tlsKeyBytes,
-        );
-      }
       return false;
     } on SocketException {
-      if (config.mode == PamMode.hardened) {
-        return _doHealthCheck(
-          config.fallbackEndpoint,
-          caCertBytes: caCertBytes,
-          tlsCertBytes: tlsCertBytes,
-          tlsKeyBytes: tlsKeyBytes,
-        );
-      }
       return false;
     }
   }
@@ -143,14 +127,8 @@ class HttpService {
     try {
       return await tryEndpoint(config.primaryEndpoint);
     } on TimeoutException {
-      if (config.mode == PamMode.hardened) {
-        return tryEndpoint(config.fallbackEndpoint);
-      }
       rethrow;
     } on SocketException {
-      if (config.mode == PamMode.hardened) {
-        return tryEndpoint(config.fallbackEndpoint);
-      }
       rethrow;
     }
   }

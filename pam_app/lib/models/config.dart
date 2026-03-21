@@ -28,5 +28,10 @@ class PamConfig {
     return 'https://$serverIp:$port';
   }
 
-  String get fallbackEndpoint => 'https://$serverIp:$port';
+  // In hardened mode the WireGuard tunnel is Layer-0; no LAN fallback is
+  // permitted because it would silently bypass WireGuard.
+  String? get fallbackEndpoint {
+    if (mode == PamMode.hardened) return null;
+    return 'https://$serverIp:$port';
+  }
 }

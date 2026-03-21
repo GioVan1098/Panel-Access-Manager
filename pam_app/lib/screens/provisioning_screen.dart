@@ -76,6 +76,7 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
       final otp = qr['otp'] as String;
       final addr = qr['addr'] as String;
       final lastColon = addr.lastIndexOf(':');
+      if (lastColon <= 0) throw Exception('Invalid address format in QR code: $addr');
       final serverIp = addr.substring(0, lastColon);
       final port = int.tryParse(addr.substring(lastColon + 1)) ?? 7443;
       final fp = qr['fp'] as String;
