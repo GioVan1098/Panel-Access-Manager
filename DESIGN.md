@@ -37,9 +37,8 @@ The daemon uses Python's `ssl` module with an explicit context:
 
 ```python
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-ctx.minimum_version     = ssl.TLSVersion.TLSv1_2
-ctx.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!MD5:!RC4')
-ctx.options            |= ssl.OP_NO_COMPRESSION | ssl.OP_SINGLE_ECDH_USE
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+ctx.options        |= ssl.OP_NO_COMPRESSION | ssl.OP_SINGLE_ECDH_USE
 ```
 
 Compression is disabled (CRIME). Only ECDHE ciphers — forward secrecy on every session.
@@ -59,7 +58,7 @@ Client certificates are signed by a local CA whose private key is **never read b
 Every command request is signed with an Ed25519 key generated and stored in the **Android Keystore** (hardware-backed, non-exportable). The canonical payload is:
 
 ```
-"<command>|<unix_timestamp>|<nonce_hex>"
+"<unix_timestamp>:<nonce_hex>:<command>"
 ```
 
 The server stores only the corresponding public key (`clients/<device_id>/sign.pub`). A server compromise gives the attacker public keys only — no forging capability.
@@ -76,7 +75,7 @@ Two independent checks:
 
 1. **Timestamp** — payload must be within ±30 seconds of server time. Requires NTP synchronisation on both sides (`setup.sh` verifies this).
 
-2. **Nonce** — 32-byte random hex, stored in SQLite (`nonces.db`) with a UNIQUE constraint on the nonce column. An `INSERT` failure on `IntegrityError` means replay. Nonces are purged after their TTL window (5 minutes).
+2. **Nonce** — 32-byte random hex, stored in SQLite (`nonces.db`) with a UNIQUE constraint on the nonce column. An `INSERT` failure on `IntegrityError` means replay. Nonces are purged after their TTL window (5 minutes). The nonce is checked on arrival but written to the database only **after** Ed25519 signature verification passes — inserting before sig verify would allow an attacker to exhaust valid nonces via invalid-signature requests (DoS on replay protection).
 
 **Why SQLite and not in-memory LRU?**
 An in-memory cache is cleared on daemon restart. An attacker who can sniff a valid packet and trigger a daemon restart (e.g. via `systemctl restart` or a power cycle) gets a ±30s replay window. SQLite survives restarts. The performance cost is one `INSERT` + one periodic `DELETE WHERE expires < now()` per request.
@@ -121,15 +120,25 @@ PC GUI → generates 128-bit OTP (60s TTL, one-time use)
        → writes QR: { "addr": "ip:port", "otp": "hex", "fp": "hex" }
 
 Android → scans QR
+         → (best-effort) GET /provision/challenge
+             TOFU: verifies SHA-256(server.der) == fp from QR
+           ← { "challenge": "<32 bytes, base64>" }  (or skip if unavailable)
          → generates Ed25519 keypair in Keystore
-         → connects with TOFU: verifies SHA-256(server.der) == fp from QR
-         → POST /provision { otp, ed25519_public_key_b64 }
+             if challenge available: setAttestationChallenge(challenge_bytes)
+               → chain = KeyStore.getCertificateChain(alias)  (leaf first)
+         → POST /provision { otp, ed25519_public_key_b64,
+                             [attestation_chain, attestation_challenge] }
 
-Server  → verifies OTP (valid, unexpired, unused)
+Server  → verifies OTP exists and is unexpired (does NOT consume yet)
+         → if attestation_chain present:
+             verify chain signatures + root against attestation_roots.pem
+             verify attestationChallenge == server-issued nonce
+             check policy (require_hardware_backed, reject_unverified_boot)
+             (if policy enforcement fails: reject — OTP is preserved)
+         → consumes OTP (one-time use enforced only after attestation passes)
          → generates client TLS cert signed with local CA
          → responds: { ca_cert, client_tls_cert, client_tls_key }
          → saves { tls.crt, sign.pub } in clients/<device_id>/
-         → invalidates OTP
 
 Android → stores { ca_cert, tls_cert, tls_key } in flutter_secure_storage
          → future connections: mTLS + Ed25519 (no more TOFU)

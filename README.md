@@ -48,7 +48,7 @@ The security mode (soft-gate vs hard-gate) is chosen at first provisioning and i
 ## Repository structure
 
 ```
-PAM_Architecture.md      full security design document (v3.3, 20 sections)
+PAM_Architecture.md      full security design document (v3.4, 20 sections + 8.6/8.7/18.6–18.10)
 pam-daemon/
   bridge_v2.py           HTTPS daemon (mTLS, Ed25519 verify, SQLite nonces, Ed25519 audit, attestation)
   ipt-helper.c           C privilege helper (setcap cap_net_admin, execv iptables)
