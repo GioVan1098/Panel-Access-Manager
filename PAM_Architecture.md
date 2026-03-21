@@ -1,10 +1,12 @@
 # PAM — Panel Access Manager
 ## Technical Architecture & Security Design Document
 
-**Version**: 3.3 (Full Android Key Attestation — L-A)
+**Version**: 3.4 (60-bug code audit — Batches 1–7)
 **Date**: 2026-03-21
 **Status**: Architecture finalized — implementation complete
 **Origin project**: rofi-bridge (SVA) → evolved into PAM
+
+**Changelog v3.4**: Full codebase security audit (60 bugs: 14 critical, 9 high, 27 medium, 6 low, 4 inconsistency — Batches 1–7). Security-critical fixes: TLS minimum version raised to 1.3 (`ssl.TLSVersion.TLSv1_3`); security operation ordering corrected in provisioning (attestation verified before OTP consumption) and runtime (nonce stored after Ed25519 signature verification, not before — preventing nonce exhaustion DoS); OTP file protected with `fcntl.flock` (LOCK_SH/LOCK_EX) against concurrent provisioning requests; `device_id` extracted from mTLS CN validated against `^[a-f0-9]{1,64}$` before any filesystem operation (path traversal prevention); `certToPem()` uses `Base64.DEFAULT` for correct 64-char PEM line wrapping; relay-setup.sh validates WireGuard public key format before writing config; `gui_gtk.c` cancels OTP countdown timer on window destroy; `main.c` installs SIGTERM/SIGINT handlers via `g_unix_signal_add`. Documentation: Section 5.10 code block updated (TLSv1_3), Section 8.3 provisioning flow corrected (attestation before OTP), Section 8.4 runtime flow corrected (nonce after sig), Section 8 expanded with 8.6 (app deprovisioning) and 8.7 (audit log verification), Section 18 expanded with pitfalls 18.6–18.10.
 
 **Changelog v3.3**: L-A — Full Android Key Attestation implemented. At provisioning, before key generation, the app fetches a server-issued 32-byte nonce (GET `/provision/challenge`, TTL 120s, one-time). The nonce is passed to `setAttestationChallenge()` at Ed25519 key generation; the resulting certificate chain (`KeyStore.getCertificateChain(alias)`) is sent with POST `/provision`. Server-side `attestation.py` verifies the chain against the Google Hardware Attestation Root CA bundle (`attestation_roots.pem`: RSA-4096 2022–2042 + EC P-384 "Key Attestation CA1" 2025–2035), checks challenge binding at `KeyDescription` index 4, and extracts `attestationSecurityLevel` + `verifiedBootState` from `teeEnforced[704]`. Custom DER TLV parser — no pyasn1 dependency. Policy configurable in `config.toml [attestation]`. Attestation is best-effort: falls back gracefully if challenge fetch fails; default `enabled = false` (results logged, not enforced). Updated: Section 8.3 (provisioning flow), Section 9.1 (new `/provision/challenge` endpoint), Section 9.4 (Flutter attestation logic), Section 9.5 (setup.sh attestation roots), Section 11 (storage model), Section 20.3 (implemented — limitation note removed). Added Section 20.3a.
 
@@ -517,19 +519,8 @@ Explicit TLS hardening:
 
 ```python
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-ctx.set_ciphers(
-    'ECDHE-ECDSA-AES256-GCM-SHA384:'
-    'ECDHE-RSA-AES256-GCM-SHA384:'
-    'ECDHE-ECDSA-CHACHA20-POLY1305:'
-    'ECDHE-RSA-CHACHA20-POLY1305:'
-    '!aNULL:!eNULL:!EXPORT:!MD5:!RC4:!3DES:!SHA1'
-)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
 ctx.options |= (
-    ssl.OP_NO_SSLv2     |
-    ssl.OP_NO_SSLv3     |
-    ssl.OP_NO_TLSv1     |
-    ssl.OP_NO_TLSv1_1   |
     ssl.OP_NO_COMPRESSION |   # CRIME attack
     ssl.OP_SINGLE_ECDH_USE    # fresh ECDH key per session
 )
@@ -888,7 +879,7 @@ Ed25519 uses `nonce = H(private_key_seed || message)` — the nonce is determini
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Layer 1 — Transport                                            │
-│  TLS 1.3 preferred (1.2 minimum), ECDHE-only cipher suites      │
+│  TLS 1.3 minimum, ECDHE-only cipher suites                      │
 │  AES-256-GCM or ChaCha20-Poly1305 (AEAD)                       │
 │  Forward secrecy: session keys derived from ephemeral ECDHE     │
 │  No compression (CRIME), fresh ECDH key per session             │
@@ -1179,12 +1170,14 @@ Android App:
 
 Server (/provision handler):
   11. Verifies OTP: exists in pending_otps.json AND not expired
-  12. Removes OTP from pending_otps.json (one-time use enforced)
-  13. If attestation_chain + attestation_challenge present:
+  12. If attestation_chain + attestation_challenge present:
       a. consume_challenge(attestation_challenge) → retrieves raw nonce bytes, deletes from store;
          if missing or expired → attestation skipped (non-blocking unless policy enforces it)
       b. verify_attestation(chain, nonce_bytes, policy) → AttestationResult
       c. Result (ok, attestation_security_level, verified_boot_state) appended to audit entry
+      (Attestation runs BEFORE OTP consumption: if attestation fails under strict policy,
+       the OTP is not consumed and the device may retry with a valid attestation chain.)
+  13. Removes OTP from pending_otps.json (one-time use enforced — only after attestation passes)
   14. Generates device_id = SHA-256(sign_pub)[:16]
   15. Generates client TLS key pair + certificate:
       openssl genrsa -out clients/<device_id>/tls.key 2048
@@ -1261,13 +1254,16 @@ Server:
   4. Splits payload: timestamp, nonce, command
   5. Validates timestamp: |now - timestamp| <= 30s → else 401
   6. Validates nonce: not in nonce_cache → else 401 (replay attack)
-     Adds nonce to nonce_cache (LRU, 5-min TTL)
+     (nonce is checked but NOT yet stored — storing before sig verify would allow
+      a DoS where an attacker exhausts valid nonces without a valid signature)
   7. Validates command: command in CommandWhitelist → else 400
   8. Loads sign.pub from clients/<device_id>/sign.pub
   9. Ed25519_verify(sign.pub, payload.encode(), sig_bytes)
      → if invalid: rate_limiter.failure(ip) + 401
-  10. rate_limiter.success(ip)
-  11. Executes command:
+  10. Stores nonce in nonce_cache (SQLite + in-memory LRU, 5-min TTL)
+      (Only after successful sig verify — nonce consumption is the last guard)
+  11. rate_limiter.success(ip)
+  12. Executes command:
       IPTABLES_CHECK → /usr/lib/rofi-bridge/ipt-helper check
       IPTABLES_OPEN  → /usr/lib/rofi-bridge/ipt-helper open
       IPTABLES_CLOSE → /usr/lib/rofi-bridge/ipt-helper close
@@ -1275,8 +1271,8 @@ Server:
       DAEMON_START   → systemctl --user start rofi-bridge
       DAEMON_STOP    → systemctl --user stop rofi-bridge
       DAEMON_RESTART → systemctl --user restart rofi-bridge
-  12. audit.log: append { ts, device_id, command, result, cert_serial }|<Ed25519_sig_b64>
-  13. Returns: { "result": "ok", "data": ... }
+  13. audit.log: append { ts, device_id, command, result, cert_serial }|<Ed25519_sig_b64>
+  14. Returns: { "result": "ok", "data": ... }
 ```
 
 ---
@@ -1307,6 +1303,61 @@ GUI GTK — "Revoke & Regenerate All":
 
 ---
 
+### 8.6 — App Deprovisioning Flow (device side)
+
+```
+Android App — "Deprovision" (Settings screen):
+  1. Calls KeystoreService.deleteKey(device_id)
+     → KeyStore.getInstance("AndroidKeyStore").deleteEntry(alias)
+     → Ed25519 private key permanently destroyed from TEE/StrongBox
+     (Key must be deleted FIRST, before clearing storage — if storage is
+      cleared first, device_id is lost and the Keystore entry is orphaned in TEE.)
+  2. Calls StorageService.clearAll()
+     → Removes from flutter_secure_storage:
+        ca_cert, tls_cert, tls_key, server_addr, security_mode, device_id, biometric_auth
+  3. App returns to provisioning screen
+  4. All future connection attempts fail: no client cert, no signing key
+
+Note: App-side deprovisioning does NOT revoke the device on the server.
+The server still holds clients/<device_id>/ with tls.crt + sign.pub.
+A server-side revocation (Section 8.5) must be performed separately
+to prevent the (now unprotected) mTLS client cert from being reused.
+If the device is lost or stolen, server-side revocation is mandatory.
+```
+
+---
+
+### 8.7 — Audit Log Verification Flow
+
+```
+Server administrator — offline audit verification:
+  1. Audit entries are in ~/.config/rofi-bridge/audit.log
+     Line format: <json_entry>|<base64_ed25519_sig>
+
+  2. Verification key: ~/.config/rofi-bridge/audit_sign.pub (chmod 444)
+     audit_sign.key is NOT needed for verification — public key only.
+     Verification can be performed on a separate, air-gapped machine.
+
+  3. For each line in audit.log:
+     a. Split on last '|': json_part, sig_b64
+     b. sig_bytes = base64.decode(sig_b64)
+     c. ed25519_pub.verify(sig_bytes, json_part.encode())
+     → If verify passes: entry is authentic and untampered
+     → If verify fails: entry has been modified after signing,
+       or was signed by a different key (key rotation, ephemeral fallback)
+
+  4. A tampered or injected entry is detected at the individual line level:
+     each line is independently signed, so partial tampering is detectable.
+
+Ephemeral fallback: if audit_sign.key is missing at daemon startup,
+an ephemeral key pair is generated for that session — entries are signed
+but cannot be verified offline (pub key is never persisted).
+setup.sh always generates a persistent keypair; ephemeral mode only occurs
+if the key file is manually removed after setup.
+```
+
+---
+
 ## 9. Component Specifications
 
 ### 9.1 — bridge_v2.py (Daemon)
@@ -1316,7 +1367,7 @@ GUI GTK — "Revoke & Regenerate All":
 | **Protocol** | HTTPS (native Python `ssl`) |
 | **Port** | 7443 (PAM) / 7443 on wg0 (PAM-hardened) / 443 optional (untrusted networks) |
 | **Bind address** | LAN IP + 127.0.0.1 (PAM) / wg0 IP + 127.0.0.1 (PAM-hardened) |
-| **TLS version** | 1.2 minimum, 1.3 preferred |
+| **TLS version** | 1.3 minimum |
 | **Cipher suites** | ECDHE+AES-GCM, ECDHE+ChaCha20 only |
 | **mTLS** | `ssl.CERT_REQUIRED` |
 | **Auth** | Ed25519 signature verification (PyCA `cryptography` library) |
@@ -2382,6 +2433,64 @@ These rules are persisted via `iptables-save` or `nftables` equivalent and resto
 
 ---
 
+### 18.6 — Security Operation Ordering
+
+**Symptom (provisioning)**: OTP is consumed on an invalid provisioning attempt — for example, a replay of an intercepted request with a wrong attestation chain. The legitimate user can no longer provision because the OTP was already spent.
+
+**Root cause**: consuming the OTP before verifying attestation means that any rejected provisioning attempt burns the OTP.
+
+**Mitigation in this design**: The OTP is only consumed *after* all verification passes (attestation, if applicable). If attestation fails under strict policy, the OTP is preserved and the device may retry with a valid chain or after re-enabling `enabled = false`.
+
+---
+
+**Symptom (runtime)**: An attacker sends a stream of replayed requests with valid timestamps but invalid signatures. The server records the nonce as consumed on the first check, so even the legitimate request (with the correct signature) is rejected as a replay.
+
+**Root cause**: storing the nonce before verifying the Ed25519 signature allows exhaustion of valid nonces via signature-invalid requests.
+
+**Mitigation in this design**: The nonce is checked against the cache on arrival, but it is only written to the SQLite database and in-memory LRU *after* the Ed25519 signature is verified successfully. An invalid-signature request does not consume a nonce.
+
+---
+
+### 18.7 — OTP File Concurrent Access
+
+**Symptom**: Two simultaneous `/provision` requests from the same client (network retry, double-tap) can both pass the OTP validity check before either removes it. Result: double-provisioning — two different devices registered under the same device_id, or the second provisioning generating a different client cert while the first is in flight.
+
+**Root cause**: `pending_otps.json` is read and written by multiple concurrent HTTP handler threads without coordination.
+
+**Mitigation in this design**: `_load_otps()` acquires a shared lock (`fcntl.flock(LOCK_SH)`) and `_save_otps()` acquires an exclusive lock (`fcntl.flock(LOCK_EX)`) on the JSON file before read/write. This serializes concurrent provisioning attempts at the filesystem level, independent of Python threading.
+
+---
+
+### 18.8 — device_id Path Traversal via mTLS CN
+
+**Symptom**: A device with a maliciously crafted TLS certificate (CN = `../../etc/passwd` or similar) causes the daemon to read or write files outside the `clients/` directory during command handling or audit.
+
+**Root cause**: `device_id` is extracted from the client certificate Subject CN field. Without validation, any string that appears in the CN is used directly in filesystem paths (`clients/<device_id>/sign.pub`).
+
+**Mitigation in this design**: The extracted `device_id` is validated against the regex `^[a-f0-9]{1,64}$` before any filesystem operation. This restricts the CN to lowercase hexadecimal strings of 1–64 characters, making path components like `..` or `/` impossible. Certificates with non-conforming CNs are rejected with a 401 at the start of every request.
+
+---
+
+### 18.9 — PEM Line Wrapping in Certificate Transmission
+
+**Symptom**: The server receives an attestation chain from the Android app and fails to parse the leaf certificate with `x509.load_pem_x509_certificate()`, even though the DER bytes are valid. Error: `ValueError: Unable to load PEM file`.
+
+**Root cause**: PEM format requires the base64-encoded body to be wrapped at 64 characters per line. `Base64.NO_WRAP` in Android's `Base64` class produces a single long line with no newlines. Some parsers (and the RFC) require line breaks; `cryptography` may tolerate it, but other TLS stacks (e.g. OpenSSL CLI, Java `CertificateFactory`) do not.
+
+**Mitigation in this design**: `certToPem()` in `MainActivity.kt` uses `Base64.DEFAULT`, which produces standard 76-character-wrapped base64 output (MIME default). The trailing newline is trimmed before wrapping the PEM header/footer.
+
+---
+
+### 18.10 — WireGuard Peer Key Format Validation
+
+**Symptom**: `relay-setup.sh` writes an invalid WireGuard config with a malformed or truncated `PublicKey` line. `wg-quick up wg0` fails silently or logs a cryptic error from the WireGuard kernel module.
+
+**Root cause**: WireGuard public keys are Curve25519 points encoded as 32-byte base64 strings — always exactly 44 characters including the trailing `=` padding. An incorrect copy-paste, a truncated key, or a key in a different format (e.g. hex, PEM header included) produces a key that the WireGuard module rejects.
+
+**Mitigation in this design**: `relay-setup.sh` validates the entered PC public key against `^[A-Za-z0-9+/]{43}=$` before writing `wg0.conf`. Any input that does not match this pattern is rejected with an error message directing the user to regenerate the key with `wg pubkey`.
+
+---
+
 ## 19. Comparison with Existing Solutions
 
 This section compares PAM with commonly used alternatives for remote execution from a mobile device. The comparison is based on the specific requirements: low-latency command dispatch, zero-install infrastructure, hardware-backed authentication, and operation on untrusted networks.
@@ -2673,5 +2782,6 @@ If `checkDeviceIntegrity()` reports `warning_level = HIGH` and the user proceeds
 *Version 2.0: Extended with deployment variants, network threat categories, PAM-hardened WireGuard architecture, untrusted network mitigations.*
 *Version 3.0 (2026-03-18): WireGuard topology correction (PC wg0 = 10.0.0.2, VPS = 10.0.0.1 routing hub only). Added: nonce cache SQLite persistence (C1), pam-setcap.service guard (C2), Flutter VPS fallback logic (C3), NTP prerequisite check (C4), PC sleep/WoL limitation (R8), Android key non-exportability (R9), port 443 conflict handling and 8443 alternative (Section 17.1), Section 18 (Implementation Pitfalls), Section 19 (Comparison with existing solutions).*
 *Version 3.1 (2026-03-20): Android client security hardening — FLAG_SECURE, BiometricPrompt soft-gate, device integrity check (Section 20). Updated version and status in header. Added R11 (TEE-less device) to residual risks.*
+*Version 3.4 (2026-03-21): 60-bug code audit (Batches 1–7 — 14 critical, 9 high, 27 medium, 6 low, 4 inconsistency). Security-critical: TLS minimum raised to 1.3 (Section 5.10, Section 7, Section 9.1); provisioning flow corrected — attestation verified before OTP consumption (Section 8.3); runtime flow corrected — nonce stored after sig verify, not before (Section 8.4); OTP file protected with fcntl.flock; device_id regex-validated before filesystem ops (path traversal prevention); certToPem uses Base64.DEFAULT for correct PEM wrapping; WireGuard pubkey format validated in relay-setup.sh. Added Section 8.6 (app deprovisioning flow) and Section 8.7 (audit log verification flow). Section 18 expanded with pitfalls 18.6–18.10 (operation ordering, OTP concurrency, path traversal, PEM wrapping, WG key validation).*
 *Version 3.3 (2026-03-21): L-A — Full Android Key Attestation. New: attestation.py (DER TLV parser + policy engine), attestation_roots.pem (Google Hardware Attestation Root CA bundle, RSA-4096 + EC P-384). Provisioning flow updated with GET /provision/challenge → setAttestationChallenge() → chain verification. Section 8.3 extended with challenge/attestation steps. Section 9.1: /provision/challenge endpoint added. Section 9.4: Flutter attestation flow. Section 9.5: setup.sh responsibility 11 (attestation roots + config). Section 11: attestation_roots.pem in storage model. Section 20.3: Limitation note replaced with implemented design. Section 20.3a: Full Hardware Key Attestation specification added.*
 *Version 3.2 (2026-03-21): L-B allowBackup=false (R3 resolved). L-C hard-gate CryptoObject biometric mode (Section 20.2, security mode selection at provisioning). L-D WireGuard PSK per peer (Section 8.2, Section 16). L-E Wake-on-LAN implementation (R8 partial, Section 20.2b). L-F Ed25519 asymmetric audit log replacing HMAC-SHA256 (Section 7, Section 9.1, Section 10, Section 11, Section 13.5, Section 19.1). Setup.sh updated with Step 3.5 (audit keypair) and --wol flag. relay-setup.sh updated with PSK generation.*
