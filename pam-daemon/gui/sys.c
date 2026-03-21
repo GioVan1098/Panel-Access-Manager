@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE 700
+
 #include "sys.h"
 
 #include <stdio.h>
@@ -5,12 +7,19 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <errno.h>
+#include <ftw.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/stat.h>
 #include <glib.h>
+#include <openssl/x509.h>
+#include <openssl/evp.h>
+#include <openssl/bn.h>
+#include <openssl/bio.h>
+#include <openssl/pem.h>
 
 /* ── Internal helpers ────────────────────────────────────────────────── */
 
@@ -20,33 +29,123 @@ static char *config_path(const char *filename)
                             ".config", "rofi-bridge", filename, NULL);
 }
 
-static char *ca_dir_path(const char *filename)
+/* JSON-escape a string into buf (truncates if buf too small). */
+static void json_escape(const char *s, char *buf, size_t buf_size)
 {
-    return g_build_filename(g_get_home_dir(),
-                            "rofi-bridge-ca", filename, NULL);
+    size_t out = 0;
+    buf[0] = '\0';
+    if (!s) return;
+    for (const char *p = s; *p && out + 2 < buf_size; p++) {
+        if (*p == '"' || *p == '\\') {
+            if (out + 3 >= buf_size) break;
+            buf[out++] = '\\';
+        }
+        buf[out++] = (unsigned char)*p;
+    }
+    buf[out] = '\0';
 }
 
-/* Run a shell command and return stdout in a heap buffer (caller frees). */
-static char *capture(const char *cmd)
+/* Compute SHA-256 of cert DER and write lowercase hex into out. */
+static int cert_sha256_hex(const char *pem_path, char *out, size_t out_size)
 {
-    FILE *p = popen(cmd, "r");
-    if (!p) return NULL;
+    FILE *f = fopen(pem_path, "r");
+    if (!f) return -1;
 
-    char *buf  = NULL;
-    size_t len = 0;
-    char   tmp[256];
+    X509 *cert = PEM_read_X509(f, NULL, NULL, NULL);
+    fclose(f);
+    if (!cert) return -1;
 
-    while (fgets(tmp, sizeof(tmp), p)) {
-        size_t tl  = strlen(tmp);
-        char  *nb  = realloc(buf, len + tl + 1);
-        if (!nb) { free(buf); pclose(p); return NULL; }
-        buf = nb;
-        memcpy(buf + len, tmp, tl);
-        len += tl;
-        buf[len] = '\0';
+    int der_len = i2d_X509(cert, NULL);
+    if (der_len <= 0) { X509_free(cert); return -1; }
+
+    unsigned char *der = malloc((size_t)der_len);
+    if (!der) { X509_free(cert); return -1; }
+
+    unsigned char *p = der;
+    i2d_X509(cert, &p);
+    X509_free(cert);
+
+    unsigned char digest[32];
+    unsigned int  digest_len = sizeof(digest);
+    EVP_MD_CTX   *ctx = EVP_MD_CTX_new();
+    if (!ctx) { free(der); return -1; }
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, der, (size_t)der_len);
+    EVP_DigestFinal_ex(ctx, digest, &digest_len);
+    EVP_MD_CTX_free(ctx);
+    free(der);
+
+    for (unsigned int i = 0; i < digest_len && i * 2 + 2 <= out_size; i++)
+        snprintf(out + i * 2, 3, "%02x", digest[i]);
+
+    return 0;
+}
+
+/* Read cert serial (hex string) and not-after date without shell. */
+static void cert_info(const char *pem_path,
+                      char *serial_out, size_t serial_size,
+                      char *enddate_out, size_t enddate_size)
+{
+    if (serial_size)  serial_out[0]  = '\0';
+    if (enddate_size) enddate_out[0] = '\0';
+
+    FILE *f = fopen(pem_path, "r");
+    if (!f) return;
+
+    X509 *cert = PEM_read_X509(f, NULL, NULL, NULL);
+    fclose(f);
+    if (!cert) return;
+
+    /* Serial as hex */
+    ASN1_INTEGER *sn = X509_get_serialNumber(cert);
+    if (sn && serial_size) {
+        BIGNUM *bn = ASN1_INTEGER_to_BN(sn, NULL);
+        if (bn) {
+            char *hex = BN_bn2hex(bn);
+            if (hex) {
+                strncpy(serial_out, hex, serial_size - 1);
+                serial_out[serial_size - 1] = '\0';
+                OPENSSL_free(hex);
+            }
+            BN_free(bn);
+        }
     }
-    pclose(p);
-    return buf;  /* may be NULL if command produced no output */
+
+    /* Not-after date as printable string */
+    const ASN1_TIME *na = X509_get0_notAfter(cert);
+    if (na && enddate_size) {
+        BIO *bio = BIO_new(BIO_s_mem());
+        if (bio) {
+            ASN1_TIME_print(bio, na);
+            char tmp[64] = "";
+            BIO_read(bio, tmp, (int)sizeof(tmp) - 1);
+            BIO_free(bio);
+            strncpy(enddate_out, tmp, enddate_size - 1);
+            enddate_out[enddate_size - 1] = '\0';
+        }
+    }
+
+    X509_free(cert);
+}
+
+/* Validate device_id: non-empty, lowercase hex characters only. */
+static int is_valid_device_id(const char *id)
+{
+    if (!id || !*id) return 0;
+    for (const char *p = id; *p; p++)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f')))
+            return 0;
+    return 1;
+}
+
+/* nftw callback for recursive directory removal (depth-first). */
+static int _rm_entry(const char *path, const struct stat *sb, int typeflag,
+                     struct FTW *ftwbuf)
+{
+    (void)sb; (void)ftwbuf;
+    if (typeflag == FTW_DP)
+        return rmdir(path);
+    return unlink(path);
 }
 
 /* ── sys_get_ip ───────────────────────────────────────────────────────── */
@@ -97,20 +196,46 @@ void sys_load_config(Config *c)
 /* ── sys_systemctl ────────────────────────────────────────────────────── */
 int sys_systemctl(const char *action)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "systemctl --user %s rofi-bridge >/dev/null 2>&1", action);
-    return WEXITSTATUS(system(cmd));
+    static const char * const allowed[] =
+        { "start", "stop", "restart", "status", NULL };
+
+    int valid = 0;
+    for (int i = 0; allowed[i]; i++)
+        if (strcmp(action, allowed[i]) == 0) { valid = 1; break; }
+    if (!valid) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+
+    if (pid == 0) {
+        char *argv[] = { "systemctl", "--user", (char *)action,
+                         "rofi-bridge", NULL };
+        execvp("systemctl", argv);
+        _exit(127);
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 /* ── sys_port_listening ───────────────────────────────────────────────── */
 int sys_port_listening(int port)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "ss -tlnp 'sport = :%d' 2>/dev/null | grep -q ':%d'",
-             port, port);
-    return WEXITSTATUS(system(cmd)) == 0;
+    if (port <= 0 || port > 65535) return 0;
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return 0;
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons((uint16_t)port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    int r   = bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+    int err = errno;
+    close(sock);
+    return r < 0 && err == EADDRINUSE;
 }
 
 /* ── sys_generate_otp ─────────────────────────────────────────────────── */
@@ -127,31 +252,11 @@ int sys_generate_otp(ProvisionQR *out, const char *ca_pass)
     else
         snprintf(addr_buf, sizeof(addr_buf), "%s:%d", cfg.ip, cfg.port);
 
-    /* 2. Compute server cert SHA-256 fingerprint */
+    /* 2. Compute server cert SHA-256 fingerprint via OpenSSL API */
     char *crt_path = config_path("server.crt");
-    char  fp_cmd[512];
-    snprintf(fp_cmd, sizeof(fp_cmd),
-             "openssl x509 -in '%s' -fingerprint -sha256 -noout 2>/dev/null",
-             crt_path);
-    g_free(crt_path);
-
-    char *fp_raw = capture(fp_cmd);
     char  fp_hex[128] = "unknown";
-    if (fp_raw) {
-        /* Format: "SHA256 Fingerprint=AA:BB:CC:..." — extract hex, strip colons */
-        char *eq = strchr(fp_raw, '=');
-        if (eq) {
-            char *p = eq + 1;
-            char *d = fp_hex;
-            while (*p && (size_t)(d - fp_hex) < sizeof(fp_hex) - 1) {
-                if (*p != ':' && *p != '\n' && *p != '\r')
-                    *d++ = *p;
-                p++;
-            }
-            *d = '\0';
-        }
-        free(fp_raw);
-    }
+    cert_sha256_hex(crt_path, fp_hex, sizeof(fp_hex));
+    g_free(crt_path);
 
     /* 3. Generate 32-byte random OTP as lowercase hex */
     FILE *urandom = fopen("/dev/urandom", "rb");
@@ -182,9 +287,6 @@ int sys_generate_otp(ProvisionQR *out, const char *ca_pass)
         fclose(ef);
     }
 
-    /* Simple JSON injection of the new OTP entry.
-     * Full JSON lib not available in C without deps; we write the entire
-     * file from scratch since pending_otps rarely has >1 entry. */
     FILE *wf = fopen(otps_path, "w");
     if (!wf) { g_free(otps_path); return -1; }
     chmod(otps_path, 0600);
@@ -193,21 +295,23 @@ int sys_generate_otp(ProvisionQR *out, const char *ca_pass)
      * (strip outer braces) then appending new entry. */
     char inner[4000] = "";
     if (strlen(existing) > 2) {
-        /* Strip leading { and trailing } */
         size_t elen = strlen(existing);
         size_t copy = (elen - 2 < sizeof(inner)) ? elen - 2 : sizeof(inner) - 1;
         strncpy(inner, existing + 1, copy);
-        /* Strip trailing whitespace/} */
         for (ssize_t i = (ssize_t)strlen(inner) - 1; i >= 0; i--) {
             if (inner[i] == '}') { inner[i] = '\0'; break; }
         }
     }
 
+    /* JSON-escape ca_pass to prevent injection */
+    char ca_pass_esc[512];
+    json_escape(ca_pass, ca_pass_esc, sizeof(ca_pass_esc));
+
     fprintf(wf, "{");
-    if (strlen(inner) > 1)   /* has prior entries */
+    if (strlen(inner) > 1)
         fprintf(wf, "%s,", inner);
     fprintf(wf, "\"%s\":{\"expires\":%ld,\"ca_pass\":\"%s\"}",
-            otp_hex, (long)expires, ca_pass);
+            otp_hex, (long)expires, ca_pass_esc);
     fprintf(wf, "}");
     fclose(wf);
 
@@ -236,39 +340,21 @@ int sys_list_devices(Device *devices, int max_count)
     struct dirent *ent;
     while ((ent = readdir(d)) && count < max_count) {
         if (ent->d_name[0] == '.') continue;
+        if (!is_valid_device_id(ent->d_name)) continue;
 
         Device *dev = &devices[count];
         strncpy(dev->device_id, ent->d_name, sizeof(dev->device_id) - 1);
         dev->serial[0]    = '\0';
         dev->not_after[0] = '\0';
 
-        /* Read cert serial + expiry via openssl */
         char *crt_path = g_build_filename(g_get_home_dir(),
                                           ".config", "rofi-bridge",
                                           "clients", ent->d_name,
                                           "tls.crt", NULL);
 
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd),
-                 "openssl x509 -in '%s' -noout -serial 2>/dev/null", crt_path);
-        char *serial_raw = capture(cmd);
-        if (serial_raw) {
-            char *eq = strchr(serial_raw, '=');
-            if (eq) strncpy(dev->serial, eq + 1, sizeof(dev->serial) - 1);
-            /* Strip newline */
-            dev->serial[strcspn(dev->serial, "\r\n")] = '\0';
-            free(serial_raw);
-        }
-
-        snprintf(cmd, sizeof(cmd),
-                 "openssl x509 -in '%s' -noout -enddate 2>/dev/null", crt_path);
-        char *enddate_raw = capture(cmd);
-        if (enddate_raw) {
-            char *eq = strchr(enddate_raw, '=');
-            if (eq) strncpy(dev->not_after, eq + 1, sizeof(dev->not_after) - 1);
-            dev->not_after[strcspn(dev->not_after, "\r\n")] = '\0';
-            free(enddate_raw);
-        }
+        cert_info(crt_path,
+                  dev->serial,    sizeof(dev->serial),
+                  dev->not_after, sizeof(dev->not_after));
 
         g_free(crt_path);
         count++;
@@ -280,20 +366,21 @@ int sys_list_devices(Device *devices, int max_count)
 /* ── sys_revoke_device ────────────────────────────────────────────────── */
 int sys_revoke_device(const char *device_id, const char *serial)
 {
+    if (!is_valid_device_id(device_id)) return -1;
+
     /* 1. Append serial to revoked.txt */
     char *revoked_path = config_path("revoked.txt");
     FILE *f = fopen(revoked_path, "a");
     if (f) { fprintf(f, "%s\n", serial); fclose(f); }
     g_free(revoked_path);
 
-    /* 2. Remove clients/<device_id>/ */
-    char cmd[512];
+    /* 2. Remove clients/<device_id>/ using nftw (no shell) */
     char *clients_dir = g_build_filename(g_get_home_dir(),
                                          ".config", "rofi-bridge",
                                          "clients", device_id, NULL);
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", clients_dir);
+    int r = nftw(clients_dir, _rm_entry, 8, FTW_DEPTH | FTW_PHYS);
     g_free(clients_dir);
-    return WEXITSTATUS(system(cmd));
+    return r;
 }
 
 /* ── sys_read_audit ───────────────────────────────────────────────────── */
