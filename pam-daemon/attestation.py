@@ -13,6 +13,7 @@ Reference: https://developer.android.com/training/articles/security-key-attestat
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from cryptography import x509
@@ -132,6 +133,14 @@ def _load_roots() -> list:
 
 def _fingerprint(cert) -> bytes:
     return cert.fingerprint(hashes.SHA256())
+
+
+# Load trust anchors once at import time to eliminate per-call file reads
+# and the race condition that would allow root substitution between calls.
+try:
+    _TRUSTED_ROOTS: list = _load_roots()
+except Exception:
+    _TRUSTED_ROOTS = []
 
 
 # ── Chain signature verification ────────────────────────────────────────
@@ -288,6 +297,16 @@ def verify_attestation(
             res.reason = f"cert parse error at index {i}: {e}"
             return res
 
+    # 1b. Reject expired or not-yet-valid certificates anywhere in the chain
+    now = datetime.now(timezone.utc)
+    for i, cert in enumerate(certs):
+        if cert.not_valid_before_utc > now:
+            res.reason = f"cert[{i}] is not yet valid (notBefore={cert.not_valid_before_utc.isoformat()})"
+            return res
+        if cert.not_valid_after_utc < now:
+            res.reason = f"cert[{i}] is expired (notAfter={cert.not_valid_after_utc.isoformat()})"
+            return res
+
     # 2. Verify chain: each cert signed by the next (leaf → root)
     for i in range(len(certs) - 1):
         if not _verify_cert_signature(certs[i], certs[i + 1]):
@@ -299,14 +318,12 @@ def verify_attestation(
         return res
 
     # 3. Root must be in our trusted anchor set (software attestation roots rejected)
-    try:
-        trusted_roots = _load_roots()
-    except Exception as e:
-        res.reason = f"failed to load trust anchors: {e}"
+    if not _TRUSTED_ROOTS:
+        res.reason = "failed to load trust anchors: attestation_roots.pem missing or empty"
         return res
 
     root_fp = _fingerprint(certs[-1])
-    if not any(_fingerprint(r) == root_fp for r in trusted_roots):
+    if not any(_fingerprint(r) == root_fp for r in _TRUSTED_ROOTS):
         res.reason = "chain root is not a trusted Google Hardware Attestation Root CA"
         return res
 
