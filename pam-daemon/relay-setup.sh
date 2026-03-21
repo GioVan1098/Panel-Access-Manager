@@ -117,12 +117,12 @@ ok "IPv4 forwarding enabled"
 if command -v ufw >/dev/null 2>&1; then
     info "Configuring UFW rules..."
     sudo ufw allow 51820/udp comment "WireGuard — PAM relay"
-    sudo ufw allow 7443/tcp  comment "PAM daemon forwarded from PC"
-    ok "UFW rules added (UDP/51820, TCP/7443)"
+    ok "UFW rules added (UDP/51820)"
+    info "Port 7443 is NOT opened: the PAM daemon runs on the PC (10.0.0.2:7443)"
+    info "inside the WireGuard tunnel — it is never reachable from the public internet."
 else
-    warn "ufw not found. Add these rules manually:"
+    warn "ufw not found. Add this rule manually:"
     warn "  iptables -A INPUT -p udp --dport 51820 -j ACCEPT"
-    warn "  iptables -A INPUT -p tcp --dport 7443 -j ACCEPT"
 fi
 
 # ── Start and enable WireGuard ────────────────────────────────────────────

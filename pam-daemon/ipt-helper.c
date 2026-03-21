@@ -16,10 +16,23 @@
 #include <errno.h>
 #include <pwd.h>
 
-#define CONFIG_REL  "/.config/rofi-bridge/config.toml"
-#define IPTABLES    "/usr/sbin/iptables"
-#define MAX_PORT    65535
+#define CONFIG_REL   "/.config/rofi-bridge/config.toml"
+#define MAX_PORT     65535
 #define DEFAULT_PORT 7443
+
+/* Locate iptables: /usr/sbin (Debian/Ubuntu) or /usr/bin (Arch/Fedora). */
+static const char *find_iptables(void)
+{
+    static const char * const paths[] = {
+        "/usr/sbin/iptables",
+        "/usr/bin/iptables",
+        NULL
+    };
+    for (int i = 0; paths[i]; i++)
+        if (access(paths[i], X_OK) == 0)
+            return paths[i];
+    return NULL;
+}
 
 static int read_port(void)
 {
@@ -64,6 +77,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    const char *iptables = find_iptables();
+    if (!iptables) {
+        fprintf(stderr, "ipt-helper: iptables not found in /usr/sbin or /usr/bin\n");
+        return 1;
+    }
+
     int port = read_port();
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
@@ -73,17 +92,17 @@ int main(int argc, char *argv[])
      * argv arrays are terminated by NULL.
      */
     if (strcmp(action, "open") == 0) {
-        char *av[] = { IPTABLES, "-I", "INPUT", "-p", "tcp",
+        char *av[] = { (char *)iptables, "-I", "INPUT", "-p", "tcp",
                        "--dport", port_str, "-j", "ACCEPT", NULL };
-        execv(IPTABLES, av);
+        execv(iptables, av);
     } else if (strcmp(action, "close") == 0) {
-        char *av[] = { IPTABLES, "-D", "INPUT", "-p", "tcp",
+        char *av[] = { (char *)iptables, "-D", "INPUT", "-p", "tcp",
                        "--dport", port_str, "-j", "ACCEPT", NULL };
-        execv(IPTABLES, av);
+        execv(iptables, av);
     } else {  /* check */
-        char *av[] = { IPTABLES, "-C", "INPUT", "-p", "tcp",
+        char *av[] = { (char *)iptables, "-C", "INPUT", "-p", "tcp",
                        "--dport", port_str, "-j", "ACCEPT", NULL };
-        execv(IPTABLES, av);
+        execv(iptables, av);
     }
 
     fprintf(stderr, "ipt-helper: execv: %s\n", strerror(errno));

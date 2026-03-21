@@ -230,7 +230,8 @@ if [ "$NEED_SERVER_CERT" -eq 1 ]; then
         SAN_VALUE="IP:${LAN_IP},DNS:${HOSTNAME_LOCAL}"
     fi
 
-    openssl genrsa -out "${CONFIG_DIR}/server.key" 2048 2>/dev/null
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+        -out "${CONFIG_DIR}/server.key" 2>/dev/null
     chmod 600 "${CONFIG_DIR}/server.key"
 
     openssl req -new \

@@ -371,7 +371,8 @@ def provision_client(device_id: str, ed25519_pubkey_b64: str, ca_pass: str) -> d
         crt_path = os.path.join(tmp, "tls.crt")
 
         subprocess.run(
-            ["openssl", "genrsa", "-out", key_path, "2048"],
+            ["openssl", "genpkey", "-algorithm", "EC",
+             "-pkeyopt", "ec_paramgen_curve:P-256", "-out", key_path],
             check=True, capture_output=True,
         )
         subprocess.run(
