@@ -398,8 +398,9 @@ def provision_client(device_id: str, ed25519_pubkey_b64: str, ca_pass: str) -> d
 
     # Save Ed25519 public key as PEM (Android Keystore returns DER X.509 SPKI)
     pub_der  = base64.b64decode(ed25519_pubkey_b64 + "==")
-    b64_pub  = base64.b64encode(pub_der).decode()
-    pem_pub  = f"-----BEGIN PUBLIC KEY-----\n{b64_pub}\n-----END PUBLIC KEY-----\n"
+    b64_raw  = base64.b64encode(pub_der).decode()
+    b64_wrap = "\n".join(b64_raw[i:i + 64] for i in range(0, len(b64_raw), 64))
+    pem_pub  = f"-----BEGIN PUBLIC KEY-----\n{b64_wrap}\n-----END PUBLIC KEY-----\n"
     with open(os.path.join(client_dir, "sign.pub"), "w") as f:
         f.write(pem_pub)
     os.chmod(os.path.join(client_dir, "sign.pub"), 0o644)
@@ -491,6 +492,8 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if not length:
                 return {}
+            if length > 65536:
+                return None
             return json.loads(self.rfile.read(length))
         except Exception:
             return None
@@ -554,17 +557,6 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400, "Missing otp or ed25519_pubkey")
             return
 
-        otp_info = consume_otp(otp)
-        if not otp_info:
-            self.send_error(403, "Invalid or expired OTP")
-            audit("provisioning", "provision", "invalid_otp", "")
-            return
-
-        ca_pass = otp_info.get("ca_pass", "")
-        if not ca_pass:
-            self.send_error(500, "CA passphrase not available")
-            return
-
         # Derive device_id from Ed25519 public key
         try:
             pub_der   = base64.b64decode(ed25519_pubkey + "==")
@@ -573,12 +565,13 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400, "Invalid ed25519_pubkey encoding")
             return
 
-        # ── L-A: Optional attestation chain verification ────────────
+        # ── L-A: Attestation verified BEFORE OTP consumption (Bug-08).
+        # If enabled=true and no chain / module unavailable → reject (Bug-11).
         attestation_chain     = body.get("attestation_chain")      # list[str] | None
         attestation_challenge = body.get("attestation_challenge")  # base64 str | None
+        policy = _attestation_policy()
 
         if attestation_chain is not None:
-            # If chain is present, challenge must be too and must still be valid
             if not attestation_challenge:
                 self.send_error(400, "attestation_chain requires attestation_challenge")
                 audit(device_id, "provision", "attest_missing_challenge", "")
@@ -591,12 +584,15 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if not _ATTESTATION_AVAILABLE:
+                if policy["enabled"]:
+                    self.send_error(403, "Attestation required but module unavailable")
+                    audit(device_id, "provision", "attest_module_missing_enforced", "")
+                    return
                 logging.warning(
                     "attestation.py not available — skipping chain verification"
                 )
                 attest_status = "attest_module_unavailable"
             else:
-                policy = _attestation_policy()
                 result = verify_attestation(attestation_chain, raw_challenge, policy)
                 if not result.ok:
                     logging.warning(
@@ -615,7 +611,24 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
                     result.verified_boot_state,
                 )
         else:
+            if policy["enabled"]:
+                self.send_error(403, "Attestation required: no chain provided")
+                audit(device_id, "provision", "attest_required_missing", "")
+                return
             attest_status = "no_attestation"
+
+        # OTP consumed after attestation passes (Bug-08: prevents burning OTP via
+        # repeated bad attestation chains)
+        otp_info = consume_otp(otp)
+        if not otp_info:
+            self.send_error(403, "Invalid or expired OTP")
+            audit("provisioning", "provision", "invalid_otp", "")
+            return
+
+        ca_pass = otp_info.get("ca_pass", "")
+        if not ca_pass:
+            self.send_error(500, "CA passphrase not available")
+            return
 
         try:
             certs = provision_client(device_id, ed25519_pubkey, ca_pass)
@@ -673,13 +686,7 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
             audit(device_id, command, "timestamp_fail", serial)
             return
 
-        # Replay protection (SQLite-backed nonce)
-        if not check_and_store_nonce(nonce, float(timestamp)):
-            self.send_error(409, "Replay detected")
-            audit(device_id, command, "replay", serial)
-            return
-
-        # Command whitelist
+        # Command whitelist — before sig verify and nonce consume
         if command not in COMMANDS:
             self.send_error(400, "Command not in whitelist")
             audit(device_id, command, "whitelist_fail", serial)
@@ -691,6 +698,12 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
             _rate.failure(ip)
             self.send_error(401, "Signature verification failed")
             audit(device_id, command, "sig_fail", serial)
+            return
+
+        # Replay protection (SQLite-backed nonce) — AFTER sig verify to prevent nonce burning
+        if not check_and_store_nonce(nonce, float(timestamp)):
+            self.send_error(409, "Replay detected")
+            audit(device_id, command, "replay", serial)
             return
 
         _rate.success(ip)
@@ -805,7 +818,7 @@ def main() -> None:
 
     # SSL context — CERT_OPTIONAL allows /provision without a client cert
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.load_cert_chain(SERVER_CRT, SERVER_KEY)
     ctx.load_verify_locations(CA_CRT)
     ctx.verify_mode = ssl.CERT_OPTIONAL
