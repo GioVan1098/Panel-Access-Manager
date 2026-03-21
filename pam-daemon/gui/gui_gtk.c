@@ -673,6 +673,16 @@ static GtkWidget *build_audit_tab(App *a)
     return vbox;
 }
 
+/* ── Window close handler ─────────────────────────────────────────────── */
+
+static void on_window_destroy(App *a)
+{
+    if (a->prov_timer_id) {
+        g_source_remove(a->prov_timer_id);
+        a->prov_timer_id = 0;
+    }
+}
+
 /* ── activate ─────────────────────────────────────────────────────────── */
 
 void activate(GtkApplication *gapp, gpointer user_data)
@@ -703,6 +713,10 @@ void activate(GtkApplication *gapp, gpointer user_data)
         build_devices_tab(a),   gtk_label_new("Devices"));
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
         build_audit_tab(a),     gtk_label_new("Audit Log"));
+
+    /* Cancel OTP countdown timer on window close to prevent use-after-free */
+    g_signal_connect_swapped(a->window, "destroy",
+                             G_CALLBACK(on_window_destroy), a);
 
     gtk_widget_show_all(a->window);
 

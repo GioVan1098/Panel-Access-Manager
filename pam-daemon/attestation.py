@@ -241,13 +241,11 @@ def _parse_root_of_trust(der: bytes) -> dict:
     """
     result: dict = {}
     try:
-        # EXPLICIT wrapper: der contains the inner SEQUENCE TLV
+        # EXPLICIT wrapper: der must contain the inner SEQUENCE TLV
         tc, cons, tn, seq_val, _ = _read_tlv(der, 0)
-        if tc == 0 and tn == 16:
-            inner = seq_val
-        else:
-            inner = der  # fallback: treat der directly as sequence content
-        items = list(_iter_seq(inner))
+        if not (tc == 0 and tn == 16):
+            raise ValueError(f"RootOfTrust: expected SEQUENCE, got class={tc} tag={tn}")
+        items = list(_iter_seq(seq_val))
         # item[0] = verifiedBootKey  (OCTET STRING — skip)
         # item[1] = deviceLocked     (BOOLEAN)
         # item[2] = verifiedBootState (ENUMERATED)

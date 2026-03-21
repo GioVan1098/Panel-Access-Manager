@@ -25,6 +25,8 @@ class _ProvisioningScreenState extends State<ProvisioningScreen> {
   final _http = HttpService();
 
   Future<void> _handleQr(String raw) async {
+    // Dart's event loop is single-threaded: the check and assignment below are
+    // atomic at the microtask level — no race condition is possible here.
     if (_processing) return;
     _processing = true;
 

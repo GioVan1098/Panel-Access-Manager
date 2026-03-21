@@ -36,11 +36,9 @@ static const char *find_iptables(void)
 
 static int read_port(void)
 {
-    const char *home = getenv("HOME");
-    if (!home) {
-        struct passwd *pw = getpwuid(getuid());
-        if (pw) home = pw->pw_dir;
-    }
+    /* Prefer getpwuid — not manipulable via environment in setcap contexts */
+    struct passwd *pw = getpwuid(getuid());
+    const char *home = pw ? pw->pw_dir : getenv("HOME");
     if (!home) return DEFAULT_PORT;
 
     char path[512];

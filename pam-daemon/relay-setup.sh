@@ -50,6 +50,7 @@ echo ""
 # ── Collect PC public key ─────────────────────────────────────────────────
 read -rp "Enter PC WireGuard public key: " PC_PUB
 [ -n "$PC_PUB" ] || die "PC public key is required."
+[[ "$PC_PUB" =~ ^[A-Za-z0-9+/]{43}=$ ]] || die "Invalid PC public key format (expected 44-char base64, e.g. from 'wg pubkey')."
 
 # ── Optional Android peer ─────────────────────────────────────────────────
 echo ""

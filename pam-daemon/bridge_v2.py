@@ -3,18 +3,20 @@
 bridge_v2.py — PAM daemon
 
 HTTPS server with mTLS, Ed25519 command verification,
-SQLite nonce cache (replay-safe across restarts), and HMAC audit log.
+SQLite nonce cache (replay-safe across restarts), and Ed25519-signed audit log.
 
 Start: python3 bridge_v2.py
        (managed by systemd user service rofi-bridge.service)
 """
 
 import base64
+import fcntl
 import hashlib
 import http.server
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import ssl
@@ -62,7 +64,9 @@ CLIENTS_DIR  = os.path.join(CONFIG_DIR, "clients")
 REVOKED_FILE = os.path.join(CONFIG_DIR, "revoked.txt")
 IPT_HELPER   = "/usr/lib/rofi-bridge/ipt-helper"
 
-VERSION = "2.1.0"
+_DEVICE_ID_RE = re.compile(r'^[a-f0-9]{1,64}$')
+
+VERSION = "3.3"
 
 # ── Constants ──────────────────────────────────────────────────────────
 CHALLENGE_TTL    = 120   # seconds: attestation challenge expiry
@@ -221,7 +225,7 @@ def audit(device_id: str, command: str, result: str, cert_serial: str = "") -> N
     if _audit_sign_key is not None:
         sig = base64.b64encode(_audit_sign_key.sign(entry.encode())).decode()
     else:
-        sig = "no_key"
+        sig = "unsigned"
     line = f"{entry}|{sig}\n"
     with _audit_lock:
         with open(AUDIT_LOG, "a") as f:
@@ -245,9 +249,12 @@ class RateLimiter:
     def allowed(self, ip: str) -> bool:
         with self._lock:
             ban_count, ban_until = self._failures.get(ip, (0, 0.0))
-            if ban_until > time.time():
+            now = time.time()
+            if ban_until > now:
                 return False
-            now   = time.time()
+            if ban_until and ban_until <= now:
+                # Expired ban — remove to prevent unbounded growth
+                self._failures.pop(ip, None)
             times = [t for t in self._requests.get(ip, []) if now - t < RATE_LIMIT_WIN]
             if len(times) >= RATE_LIMIT_REQ:
                 return False
@@ -304,13 +311,15 @@ def verify_ed25519(device_id: str, canonical: str, sig_b64: str) -> bool:
 
     The public key stored in sign.pub is PEM-encoded X.509 SubjectPublicKeyInfo.
     """
+    if not _DEVICE_ID_RE.match(device_id):
+        return False
     pub_path = os.path.join(CLIENTS_DIR, device_id, "sign.pub")
     if not os.path.exists(pub_path):
         return False
     try:
         with open(pub_path, "rb") as f:
             pub = load_pem_public_key(f.read())
-        sig = base64.b64decode(sig_b64 + "==")  # pad if needed
+        sig = base64.b64decode(sig_b64 + "=" * (-len(sig_b64) % 4))
         pub.verify(sig, canonical.encode())
         return True
     except (InvalidSignature, Exception):
@@ -326,14 +335,22 @@ def _load_otps() -> dict:
         return {}
     try:
         with open(PENDING_OTPS) as f:
-            return json.load(f)
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                return json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
     except Exception:
         return {}
 
 
 def _save_otps(otps: dict) -> None:
     with open(PENDING_OTPS, "w") as f:
-        json.dump(otps, f)
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            json.dump(otps, f)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
     os.chmod(PENDING_OTPS, 0o600)
 
 
@@ -362,6 +379,8 @@ def provision_client(device_id: str, ed25519_pubkey_b64: str, ca_pass: str) -> d
 
     Returns: {"tls_key": <pem>, "tls_crt": <pem>, "ca_crt": <pem>}
     """
+    if not _DEVICE_ID_RE.match(device_id):
+        raise ValueError(f"Invalid device_id: {device_id!r}")
     client_dir = os.path.join(CLIENTS_DIR, device_id)
     os.makedirs(client_dir, mode=0o700, exist_ok=True)
 
@@ -420,6 +439,8 @@ def execute_command(cmd: str) -> tuple[int, str]:
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
         out = (r.stdout + r.stderr).strip()
+        if len(out) > 10000:
+            logging.warning("execute_command %s: output truncated (%d → 10000 chars)", cmd, len(out))
         return r.returncode, out[:10000]
     except subprocess.TimeoutExpired:
         return 1, "Command timed out"
@@ -454,8 +475,9 @@ def _attestation_policy() -> dict:
 
 # ── HTTP request handler ───────────────────────────────────────────────
 class PAMHandler(http.server.BaseHTTPRequestHandler):
-    server_version = f"PAM/{VERSION}"
+    server_version   = "PAM"          # no version in Server header (fingerprinting)
     protocol_version = "HTTP/1.1"
+    timeout          = 30             # seconds; prevents thread leak on slow/idle clients
 
     def log_message(self, fmt, *args):
         pass  # all logging goes through audit()
@@ -476,8 +498,16 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
         c = self._cert()
         if not c:
             return None, None
-        subject = {k: v for x in c.get("subject", []) for k, v in x}
-        return subject.get("commonName"), str(c.get("serialNumber", ""))
+        # Use first CN only — dict comprehension last-wins is wrong on duplicate CNs
+        cn: Optional[str] = None
+        for rdn in c.get("subject", []):
+            for k, v in rdn:
+                if k == "commonName":
+                    cn = v
+                    break
+            if cn is not None:
+                break
+        return cn, str(c.get("serialNumber", ""))
 
     def _send_json(self, code: int, body: dict) -> None:
         payload = json.dumps(body).encode()
@@ -542,7 +572,9 @@ class PAMHandler(http.server.BaseHTTPRequestHandler):
         if is_revoked(serial):
             self.send_error(403, "Certificate revoked")
             return
-        self._send_json(200, {"lines": read_audit(50)})
+        # Only return log lines for this device — no cross-device leakage
+        lines = [l for l in read_audit(200) if device_id in l]
+        self._send_json(200, {"lines": lines[-50:]})
 
     # ── /provision ─────────────────────────────────────────────────────
     def _h_provision(self):

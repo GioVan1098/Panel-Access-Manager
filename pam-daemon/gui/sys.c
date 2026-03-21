@@ -154,21 +154,29 @@ void sys_get_ip(char *buf, size_t n)
     strncpy(buf, "unknown", n);
     buf[n - 1] = '\0';
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return;
+    /* Try multiple targets: 8.8.8.8 for normal LAN, 10.0.0.1 for
+     * WireGuard-only environments where no public route exists. */
+    static const char * const targets[] = { "8.8.8.8", "10.0.0.1", NULL };
+    for (int i = 0; targets[i]; i++) {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) continue;
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(80);
-    inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr);
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(80);
+        inet_pton(AF_INET, targets[i], &addr.sin_addr);
 
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-        struct sockaddr_in local;
-        socklen_t len2 = sizeof(local);
-        if (getsockname(sock, (struct sockaddr *)&local, &len2) == 0)
-            strncpy(buf, inet_ntoa(local.sin_addr), n - 1);
+        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            struct sockaddr_in local;
+            socklen_t len2 = sizeof(local);
+            if (getsockname(sock, (struct sockaddr *)&local, &len2) == 0) {
+                strncpy(buf, inet_ntoa(local.sin_addr), n - 1);
+                close(sock);
+                return;
+            }
+        }
+        close(sock);
     }
-    close(sock);
 }
 
 /* ── sys_load_config ──────────────────────────────────────────────────── */
@@ -184,6 +192,11 @@ void sys_load_config(Config *c)
 
     char line[256];
     while (fgets(line, sizeof(line), f)) {
+        /* Skip comment and blank lines to avoid matching TOML comments */
+        char *t = line;
+        while (*t == ' ' || *t == '\t') t++;
+        if (*t == '#' || *t == '\0' || *t == '\n' || *t == '\r') continue;
+
         int p;
         if (sscanf(line, "port = %d", &p) == 1)
             c->port = p;
@@ -279,11 +292,17 @@ int sys_generate_otp(ProvisionQR *out, const char *ca_pass)
 
     char *otps_path = config_path("pending_otps.json");
 
-    /* Read existing OTPs (may be empty) */
+    /* Read existing OTPs (may be empty).
+     * If the file exceeds 4095 bytes something is wrong — start fresh
+     * rather than silently truncating and producing malformed JSON. */
     char existing[4096] = "{}";
     FILE *ef = fopen(otps_path, "r");
     if (ef) {
-        fread(existing, 1, sizeof(existing) - 1, ef);
+        fseek(ef, 0, SEEK_END);
+        long file_size = ftell(ef);
+        rewind(ef);
+        if (file_size > 0 && file_size < (long)(sizeof(existing) - 1))
+            fread(existing, 1, (size_t)file_size, ef);
         fclose(ef);
     }
 

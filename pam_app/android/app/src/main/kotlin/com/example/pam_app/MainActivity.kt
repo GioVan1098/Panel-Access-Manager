@@ -255,7 +255,7 @@ class MainActivity : FlutterFragmentActivity() {
 
     /** Encode a java.security.cert.Certificate as a PEM string. */
     private fun certToPem(cert: Certificate): String {
-        val b64 = Base64.encodeToString(cert.encoded, Base64.NO_WRAP)
+        val b64 = Base64.encodeToString(cert.encoded, Base64.DEFAULT).trimEnd()
         return "-----BEGIN CERTIFICATE-----\n$b64\n-----END CERTIFICATE-----"
     }
 
