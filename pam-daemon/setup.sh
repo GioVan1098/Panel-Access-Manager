@@ -170,8 +170,8 @@ if [ ! -f "${CONFIG_DIR}/config.toml" ] || [ "$REGEN_ALL" -eq 1 ]; then
     cat > "${CONFIG_DIR}/config.toml" <<TOML
 port           = ${PORT}
 mode           = "${MODE}"
-bind_ip        = "${BIND_IP}"
-untrusted_mode = $([ "$UNTRUSTED" -eq 1 ] && echo "true" || echo "false")
+bind           = "${BIND_IP}"
+untrusted      = $([ "$UNTRUSTED" -eq 1 ] && echo "true" || echo "false")
 wol_enabled    = $([ "$WOL" -eq 1 ] && echo "true" || echo "false")
 
 # L-A: Hardware Key Attestation
